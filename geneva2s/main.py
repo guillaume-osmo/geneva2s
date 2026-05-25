@@ -12,6 +12,10 @@ Three backends, three adaptive-inference modes:
     --mode erg              ERG fingerprint + cosine (pharmacophore-coherent;
                             scaffold-hop aware; GPU via mlxmolkit)
 
+    --optimizer adam        Keras-parity default
+              adamuonn      MuonN matrix + AdamN scalar (recommended on M3 Max)
+    --augment 5             reproduce the 2019 naug_5x training corpus
+
 Quick start:
 
     # one-shot generation, PyTorch
@@ -37,12 +41,23 @@ from pathlib import Path
 import numpy as np
 
 from .tokenizer import CharTokenizer
-from .utils import canonicalize, sanity_check
+from .utils import augment_corpus, canonicalize, sanity_check
 
 
-def _load_corpus(path: str):
+def _load_corpus(path: str, augment: int = 1, verbose: bool = True):
+    """Load a SMILES corpus and optionally expand it via random-walk augmentation.
+
+    augment=1 keeps the canonical form only (= the original geneva2s behavior).
+    augment=5 reproduces Chembl24_9k_organic_naug_5x.smi (5× variants per mol),
+    which is what the 2019 Smiles-GEN paper trained on and what the Keras/DPO
+    checkpoints used. n_aug > 1 trades startup cost for higher validity.
+    """
     with open(path) as f:
         raw = [line.strip() for line in f if line.strip()]
+    if augment > 1:
+        if verbose:
+            print(f"  augmenting corpus {augment}× via random-walk SMILES variants...")
+        raw = augment_corpus(raw, n_aug=augment)
     train_canonical = set(c for c in (canonicalize(s) for s in raw) if c)
     return raw, train_canonical
 
@@ -151,6 +166,8 @@ def _run_pytorch(args, raw, train_canonical):
         t0 = time.time()
         fit_best(model, X, y, device, tok, text,
                  num_epochs=args.epochs, batch_size=args.batch_size,
+                 lr=args.lr, optimizer=args.optimizer,
+                 weight_decay=args.weight_decay,
                  check_every=args.check_every, save_path=args.model_path)
         print(f"  trained in {time.time()-t0:.1f}s -> {args.model_path}")
     else:
@@ -227,6 +244,9 @@ def _run_mlx(args, raw, train_canonical):
     model = cls(tok.vocab_size)
     if not args.skip_train:
         X, y = tok.sliding_window(text)
+        if args.optimizer != "adam":
+            print(f"  note: --optimizer {args.optimizer} is torch-only for now; "
+                  f"MLX backend uses mlx.optimizers.Adam.")
         print(f"training {args.epochs} epochs on X={X.shape}...")
         t0 = time.time()
         fit_best(model, X, y, tok, text,
@@ -267,6 +287,20 @@ def main():
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--check-every", type=int, default=5)
+    p.add_argument("--lr", type=float, default=3e-3,
+                   help="Learning rate (Keras-parity default 3e-3)")
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="Weight decay (passed to AdamW / Muon family; 0 for plain Adam)")
+    p.add_argument("--optimizer",
+                   choices=["adam", "adamw", "adamn",
+                            "muon", "adamuon", "adamuonn",
+                            "adamuon_official", "muon_vx"],
+                   default="adam",
+                   help="Optimizer for PyTorch training. 'adam' = Keras-parity default; "
+                        "'adamuonn' = MuonN matrix + AdamN scalar (recommended on M3 Max)")
+    p.add_argument("--augment", type=int, default=1,
+                   help="Per-molecule random-walk SMILES variants. "
+                        "1 = canonical only (default); 5 = reproduce the 2019 naug_5x corpus")
     p.add_argument("--skip-train", action="store_true")
     p.add_argument("--model-path", default=None)
 
@@ -349,7 +383,7 @@ def main():
         else:
             args.model_path = str(repo_root / "models" / "geneva2s_torch.pt")
 
-    raw, train_canonical = _load_corpus(args.smi)
+    raw, train_canonical = _load_corpus(args.smi, augment=args.augment)
     print(f"corpus: {len(raw)} input SMILES, {len(train_canonical)} canonical unique")
 
     if args.backend == "mlx":
