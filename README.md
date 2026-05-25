@@ -19,6 +19,26 @@ pip install -e .[all,tests]      # everything + pytest
 > **Note on TF version**: use exactly `tensorflow==2.15.1` + `tensorflow-metal==1.1.0`
 > on Apple Silicon. TF 2.16+ silently drops many LSTM ops to CPU (10-20× slower).
 
+### Apple Silicon (M3 Max) environment setup
+
+Validated setup for this repository:
+
+```bash
+uv venv --python 3.11
+source .venv/bin/activate
+uv pip install -e ".[tests]"
+uv pip install "torch==2.12" "tensorflow==2.15.1" "tensorflow-metal==1.1.0" "mlx>=0.20"
+uv pip install --force-reinstall --no-deps git+https://github.com/guillaume-osmo/mlx-addons.git@main
+```
+
+If you have local RDKit/OpenBabel overrides in your shell, run commands with a
+clean environment to avoid binary conflicts:
+
+```bash
+env -u PYTHONPATH -u DYLD_LIBRARY_PATH uv run -m pytest -q
+env -u PYTHONPATH -u DYLD_LIBRARY_PATH uv run -m bench.bench_three_frameworks
+```
+
 ## Repository layout
 
 ```
