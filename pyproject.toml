@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "geneva2s"
+version = "0.1.0"
+description = "Autodidactic SMILES generator — PyTorch and TensorFlow variants. Based on the GEN architecture by Godin, Ertl, and van Deursen, with significant modifications."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Guillaume Godin" },
+]
+dependencies = [
+    "numpy",
+    "rdkit",
+    "h5py",
+]
+
+[project.optional-dependencies]
+torch = ["torch>=2.0"]
+tf = ["tensorflow==2.15.1", "tensorflow-metal==1.1.0"]
+mlx = ["mlx>=0.20"]
+tests = ["pytest>=7.0"]
+all = ["torch>=2.0", "tensorflow==2.15.1", "tensorflow-metal==1.1.0", "mlx>=0.20", "pytest>=7.0"]
+
+[tool.setuptools.packages.find]
+include = ["geneva2s*"]
+exclude = ["tests*"]

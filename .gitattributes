@@ -1,0 +1,5 @@
+data/*.zip filter=lfs diff=lfs merge=lfs -text
+data/dpo_pairs_*.json filter=lfs diff=lfs merge=lfs -text
+models/*.keras filter=lfs diff=lfs merge=lfs -text
+models/*.pt filter=lfs diff=lfs merge=lfs -text
+models/*.safetensors filter=lfs diff=lfs merge=lfs -text
