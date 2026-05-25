@@ -106,23 +106,28 @@ def make_plot(data, batch_sizes, out_path):
         ax.plot(batch_sizes, [1000 * y for y in ys], color=color, marker=marker,
                 linestyle=ls, linewidth=lw, markersize=9, label=label)
 
-    ax.set_xscale("log", base=2)
-    ax.set_yscale("log")
-    ax.set_xticks(batch_sizes)
-    ax.set_xticklabels([str(b) for b in batch_sizes])
-    yt = [1, 2, 5, 10, 20, 50]
-    ax.set_yticks(yt)
-    ax.set_yticklabels([str(v) for v in yt])
-    ax.set_xlabel("Batch size  (molecules per forward pass, log₂ scale)", fontsize=12)
-    ax.set_ylabel("Forward-pass latency  (ms, log scale)", fontsize=12)
+    # Use categorical x positions (evenly spaced) so small batches don't get squashed
+    xpos = list(range(len(batch_sizes)))
+    fig.clf()
+    fig, ax = plt.subplots(figsize=(9, 6), dpi=140)
+    for label, ys, color, marker, ls, lw in series:
+        if ys is None:
+            continue
+        ax.plot(xpos, [1000 * y for y in ys], color=color, marker=marker,
+                linestyle=ls, linewidth=lw, markersize=9, label=label)
+
+    ax.set_xticks(xpos)
+    ax.set_xticklabels([str(b) for b in batch_sizes], fontsize=11)
+    ax.set_xlabel("Batch size  (molecules per forward pass)", fontsize=12)
+    ax.set_ylabel("Forward-pass latency  (ms)", fontsize=12)
     ax.set_title(
         "GENEVA²S forward-pass speed on Apple M4 Pro\n"
         "biLSTM 128 → 4 × LSTM 64 → Dense (≈495k params), one-hot input maxlen=42",
         fontsize=12,
     )
-    ax.grid(True, which="both", alpha=0.25, linestyle=":")
-    ax.legend(loc="upper right", fontsize=10, framealpha=0.95)
-    ax.set_ylim(1.5, 50)
+    ax.grid(True, alpha=0.25, linestyle=":")
+    ax.legend(loc="upper left", fontsize=10, framealpha=0.95)
+    ax.set_ylim(0, max([1000 * y for ys in data.values() if ys for y in ys]) * 1.08)
     fig.tight_layout()
     fig.savefig(out_path, dpi=140, bbox_inches="tight")
     print(f"saved → {out_path}")
