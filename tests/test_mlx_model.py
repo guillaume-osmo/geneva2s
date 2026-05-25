@@ -107,3 +107,59 @@ class TestFusedEquivalence:
         max_diff = np.abs(o_base - o_fused).max()
         # ~5e-6 expected (float32 epsilon)
         assert max_diff < 1e-4, f"baseline vs fused max diff {max_diff}"
+
+
+# mlx-addons (custom Metal kernels) is optional — only test if importable
+try:
+    from mlx_addons.recurrent import MetalLSTM  # noqa
+    _HAS_MLX_ADDONS = True
+except ImportError:
+    _HAS_MLX_ADDONS = False
+
+
+@pytest.mark.skipif(not (_HAS_MLX_ADDONS and PT_MODEL.exists()),
+                    reason="mlx-addons not installed or no PT checkpoint")
+class TestMetalVariants:
+    """GenevaBiLSTMMLXMetal{,Grouped} use custom Metal kernels — should match
+    the baseline within float32 epsilon."""
+
+    def test_metal_matches_baseline(self):
+        from geneva2s.mlx.model import GenevaBiLSTMMLXMetal
+        m_base = GenevaBiLSTMMLX(vocab_size=27)
+        m_base.load_pt_checkpoint(str(PT_MODEL))
+        m_metal = GenevaBiLSTMMLXMetal(vocab_size=27)
+        m_metal.load_pt_checkpoint(str(PT_MODEL))
+        rng = np.random.RandomState(0)
+        x = mx.array(rng.randint(0, 27, (4, 42)).astype(np.int32))
+        o_b = np.array(m_base(x)); mx.eval(o_b)
+        o_m = np.array(m_metal(x)); mx.eval(o_m)
+        assert np.abs(o_b - o_m).max() < 1e-3, "metal vs baseline too far"
+
+    def test_metal_grouped_matches_baseline(self):
+        from geneva2s.mlx.model import GenevaBiLSTMMLXMetalGrouped
+        m_base = GenevaBiLSTMMLX(vocab_size=27)
+        m_base.load_pt_checkpoint(str(PT_MODEL))
+        m_mg = GenevaBiLSTMMLXMetalGrouped(vocab_size=27)
+        m_mg.load_pt_checkpoint(str(PT_MODEL))
+        rng = np.random.RandomState(0)
+        x = mx.array(rng.randint(0, 27, (4, 42)).astype(np.int32))
+        o_b = np.array(m_base(x)); mx.eval(o_b)
+        o_mg = np.array(m_mg(x)); mx.eval(o_mg)
+        assert np.abs(o_b - o_mg).max() < 1e-3, "metal-grouped vs baseline too far"
+
+    def test_precise_mode_tighter(self):
+        """Precise math toggle should give closer match to baseline than fast."""
+        from geneva2s.mlx.model import GenevaBiLSTMMLXMetal
+        m_base = GenevaBiLSTMMLX(vocab_size=27)
+        m_base.load_pt_checkpoint(str(PT_MODEL))
+        rng = np.random.RandomState(0)
+        x = mx.array(rng.randint(0, 27, (4, 42)).astype(np.int32))
+        o_b = np.array(m_base(x)); mx.eval(o_b)
+        m_fast = GenevaBiLSTMMLXMetal(vocab_size=27, precise=False)
+        m_fast.load_pt_checkpoint(str(PT_MODEL))
+        m_prec = GenevaBiLSTMMLXMetal(vocab_size=27, precise=True)
+        m_prec.load_pt_checkpoint(str(PT_MODEL))
+        diff_fast = np.abs(o_b - np.array(m_fast(x))).max()
+        diff_prec = np.abs(o_b - np.array(m_prec(x))).max()
+        # precise should match the baseline as well or better than fast
+        assert diff_prec <= diff_fast + 1e-7, f"precise {diff_prec:.2e} vs fast {diff_fast:.2e}"

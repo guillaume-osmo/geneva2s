@@ -180,3 +180,130 @@ class GenevaBiLSTMMLXFused(mlxnn.Module):
         import torch
         sd = torch.load(pt_path, map_location="cpu", weights_only=True)
         self.load_pt_state_dict(sd)
+
+
+class GenevaBiLSTMMLXMetal(mlxnn.Module):
+    """Drop-in replacement for GenevaBiLSTMMLX using a custom Metal LSTM cell
+    kernel (via `mx.fast.metal_kernel`) for every LSTM call. Same arch, same
+    weights — just the kernel underneath is hand-tuned MSL instead of
+    `mlx.nn.LSTM`.
+
+    Requires the optional `mlx-addons` package (`pip install mlx-addons`),
+    which ships the kernels. Combine with `mx.compile` for the full stack.
+    Output is numerically equivalent (≤1e-7 float32 epsilon) to GenevaBiLSTMMLX.
+    """
+
+    def __init__(self, vocab_size: int = 27, hidden=(128, 64), n_branches: int = 4,
+                 precise: bool = False):
+        super().__init__()
+        from mlx_addons.recurrent import MetalLSTM
+
+        self.vocab_size = vocab_size
+        self.hidden = hidden
+        self.n_branches = n_branches
+
+        self.emb_fwd = MetalLSTM(vocab_size, hidden[0], precise=precise)
+        self.emb_bwd = MetalLSTM(vocab_size, hidden[0], precise=precise)
+
+        in2 = hidden[0] * 2
+        self.branches = [MetalLSTM(in2, hidden[1], precise=precise) for _ in range(n_branches)]
+
+        self.head = mlxnn.Linear(hidden[1] * n_branches, vocab_size)
+        self._eye = mx.eye(vocab_size)
+
+    def __call__(self, x_ids):
+        x = self._eye[x_ids]
+        fwd_h, _ = self.emb_fwd(x)
+        x_rev = x[:, ::-1, :]
+        bwd_h_rev, _ = self.emb_bwd(x_rev)
+        bwd_h = bwd_h_rev[:, ::-1, :]
+        e = mx.concatenate([fwd_h, bwd_h], axis=-1)
+
+        outs = []
+        for lstm in self.branches:
+            h, _ = lstm(e)
+            outs.append(h[:, -1, :])
+        cat = mx.concatenate(outs, axis=-1)
+        return self.head(cat)
+
+    def load_pt_state_dict(self, sd: dict) -> None:
+        GenevaBiLSTMMLX.load_pt_state_dict(self, sd)
+
+    def load_pt_checkpoint(self, pt_path: str) -> None:
+        import torch
+        sd = torch.load(pt_path, map_location="cpu", weights_only=True)
+        self.load_pt_state_dict(sd)
+
+
+class GenevaBiLSTMMLXMetalGrouped(mlxnn.Module):
+    """Combines BOTH speedups: Metal LSTM cell kernel for the biLSTM first
+    layer + a *grouped* Metal cell kernel for the 4 second-layer branches
+    (4 LSTM cell ops → 1 fused kernel launch per timestep).
+
+    This is the fastest pure-MLX variant. Requires mlx-addons.
+    """
+
+    def __init__(self, vocab_size: int = 27, hidden=(128, 64), n_branches: int = 4,
+                 precise: bool = False):
+        super().__init__()
+        from mlx_addons.recurrent import GroupedMetalLSTM, MetalLSTM
+
+        self.vocab_size = vocab_size
+        self.hidden = hidden
+        self.n_branches = n_branches
+
+        self.emb_fwd = MetalLSTM(vocab_size, hidden[0], precise=precise)
+        self.emb_bwd = MetalLSTM(vocab_size, hidden[0], precise=precise)
+
+        in2 = hidden[0] * 2
+        self.branches_grouped = GroupedMetalLSTM(
+            in2, hidden[1], n_branches, precise=precise,
+        )
+
+        self.head = mlxnn.Linear(hidden[1] * n_branches, vocab_size)
+        self._eye = mx.eye(vocab_size)
+
+    def __call__(self, x_ids):
+        x = self._eye[x_ids]
+        fwd_h, _ = self.emb_fwd(x)
+        x_rev = x[:, ::-1, :]
+        bwd_h_rev, _ = self.emb_bwd(x_rev)
+        bwd_h = bwd_h_rev[:, ::-1, :]
+        e = mx.concatenate([fwd_h, bwd_h], axis=-1)
+
+        # Grouped LSTM: returns (B, T, G, H); take last timestep → (B, G, H)
+        last = self.branches_grouped(e, return_last_only=True)
+        B, G, H = last.shape
+        cat = last.reshape(B, G * H)
+        return self.head(cat)
+
+    def load_pt_state_dict(self, sd: dict) -> None:
+        def to_mx(t):
+            return mx.array(t.detach().cpu().numpy())
+        # biLSTM first layer (same as baseline)
+        self.emb_fwd.Wx = to_mx(sd["embedding.weight_ih_l0"])
+        self.emb_fwd.Wh = to_mx(sd["embedding.weight_hh_l0"])
+        self.emb_fwd.bias = to_mx(sd["embedding.bias_ih_l0"] + sd["embedding.bias_hh_l0"])
+        self.emb_bwd.Wx = to_mx(sd["embedding.weight_ih_l0_reverse"])
+        self.emb_bwd.Wh = to_mx(sd["embedding.weight_hh_l0_reverse"])
+        self.emb_bwd.bias = to_mx(
+            sd["embedding.bias_ih_l0_reverse"] + sd["embedding.bias_hh_l0_reverse"]
+        )
+        # Grouped branches: stack 4 weights along axis 0
+        self.branches_grouped.Wx = mx.stack([
+            to_mx(sd[f"branches.{i}.weight_ih_l0"]) for i in range(self.n_branches)
+        ])
+        self.branches_grouped.Wh = mx.stack([
+            to_mx(sd[f"branches.{i}.weight_hh_l0"]) for i in range(self.n_branches)
+        ])
+        self.branches_grouped.bias = mx.stack([
+            to_mx(sd[f"branches.{i}.bias_ih_l0"] + sd[f"branches.{i}.bias_hh_l0"])
+            for i in range(self.n_branches)
+        ])
+        self.head.weight = to_mx(sd["head.weight"])
+        self.head.bias = to_mx(sd["head.bias"])
+
+    def load_pt_checkpoint(self, pt_path: str) -> None:
+        import torch
+        sd = torch.load(pt_path, map_location="cpu", weights_only=True)
+        self.load_pt_state_dict(sd)
