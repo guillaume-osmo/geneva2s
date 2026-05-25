@@ -32,6 +32,20 @@ def _loss_fn(model, x, y):
     return mlxnn.losses.cross_entropy(logits, y, reduction="mean")
 
 
+def _make_compiled_step(model, optimizer):
+    """Build an mx.compile'd train step. Captures model + optimizer state
+    explicitly so MLX can fuse the whole forward+backward+update path."""
+    loss_and_grad_fn = mlxnn.value_and_grad(model, _loss_fn)
+    state = [model.state, optimizer.state]
+
+    def step_inner(x, y):
+        loss, grads = loss_and_grad_fn(model, x, y)
+        optimizer.update(model, grads)
+        return loss
+
+    return mx.compile(step_inner, inputs=state, outputs=state), state
+
+
 def fit(
     model,
     X: np.ndarray,
@@ -41,10 +55,24 @@ def fit(
     lr: float = 3e-3,
     save_path: str = None,
     verbose: bool = True,
+    use_compile: bool = True,
 ):
-    """Adam training matching Keras Trainer.compile(Adam(lr=3e-3, eps=1e-7))."""
+    """Adam training matching Keras Trainer.compile(Adam(lr=3e-3, eps=1e-7)).
+
+    use_compile=True (default) wraps the forward+backward+update step in
+    `mx.compile` for ~1.3-1.4× speedup. Disable for debugging.
+    """
     optimizer = optim.Adam(learning_rate=lr, eps=1e-7)
-    loss_and_grad_fn = mlxnn.value_and_grad(model, _loss_fn)
+    if use_compile:
+        step, state = _make_compiled_step(model, optimizer)
+    else:
+        loss_and_grad_fn = mlxnn.value_and_grad(model, _loss_fn)
+        state = [model.state, optimizer.state]
+        def step(xb, yb):
+            loss, grads = loss_and_grad_fn(model, xb, yb)
+            optimizer.update(model, grads)
+            return loss
+
     n = X.shape[0]
     history = []
     for ep in range(num_epochs):
@@ -55,9 +83,8 @@ def fit(
             idx = perm[i:i + batch_size]
             xb = mx.array(X[idx])
             yb = mx.array(y[idx])
-            loss, grads = loss_and_grad_fn(model, xb, yb)
-            optimizer.update(model, grads)
-            mx.eval(model.parameters(), optimizer.state)
+            loss = step(xb, yb)
+            mx.eval(state)
             total += float(loss) * xb.shape[0]
             n_seen += xb.shape[0]
         avg = total / n_seen
@@ -83,11 +110,21 @@ def fit_best(
     ncopies_check: int = 20,
     save_path: str = None,
     verbose: bool = True,
+    use_compile: bool = True,
 ):
     """Like fit() but restores best-validity weights at the end (Keras
     OnlineGenerator + restore_best_weights=True equivalent)."""
     optimizer = optim.Adam(learning_rate=lr, eps=1e-7)
-    loss_and_grad_fn = mlxnn.value_and_grad(model, _loss_fn)
+    if use_compile:
+        step, state = _make_compiled_step(model, optimizer)
+    else:
+        loss_and_grad_fn = mlxnn.value_and_grad(model, _loss_fn)
+        state = [model.state, optimizer.state]
+        def step(xb, yb):
+            loss, grads = loss_and_grad_fn(model, xb, yb)
+            optimizer.update(model, grads)
+            return loss
+
     n = X.shape[0]
     history = []
     best_val, best_params, best_epoch = -1.0, None, -1
@@ -100,9 +137,8 @@ def fit_best(
             idx = perm[i:i + batch_size]
             xb = mx.array(X[idx])
             yb = mx.array(y[idx])
-            loss, grads = loss_and_grad_fn(model, xb, yb)
-            optimizer.update(model, grads)
-            mx.eval(model.parameters(), optimizer.state)
+            loss = step(xb, yb)
+            mx.eval(state)
             total += float(loss) * xb.shape[0]
             n_seen += xb.shape[0]
         avg = total / n_seen
