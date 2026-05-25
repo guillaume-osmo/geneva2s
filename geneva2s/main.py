@@ -8,7 +8,7 @@ Three backends, two inference modes:
 
     --adaptive              run the autodidactic round-based loop
     --mode default          InChIKey-3-prefix clustering (CPU, fast)
-    --mode discovery        ERG fingerprint clustering (GPU via mlx-addons)
+    --mode discovery        Morgan/Tanimoto clustering (GPU via mlxmolkit)
 
 Quick start:
 
@@ -72,7 +72,7 @@ def _generation_phase(args, generator_func, train_canonical, label: str):
               f"{args.n_generate}/round")
         t0 = time.time()
         # Map CLI --mode to adaptive.run_adaptive's mode strings
-        mode = "discovery" if args.mode in ("erg", "discovery") else "default"
+        mode = "discovery" if args.mode in ("morgan", "discovery") else "default"
         explorer_kwargs = {}
         if mode == "discovery":
             explorer_kwargs.update(
@@ -269,16 +269,16 @@ def main():
                    help="Run adaptive (round-based) inference instead of one-shot")
     p.add_argument("--rounds", type=int, default=5,
                    help="Number of adaptive rounds (default 5)")
-    p.add_argument("--mode", choices=["default", "inchikey", "erg", "discovery"],
+    p.add_argument("--mode", choices=["default", "inchikey", "morgan", "discovery"],
                    default="default",
                    help="Adaptive clustering: 'default'/'inchikey' (CPU, fast) or "
-                        "'erg'/'discovery' (GPU via mlx-addons, scaffold-aware)")
-    p.add_argument("--cluster-threshold", type=float, default=0.75,
-                   help="ERG cosine threshold for cluster membership (discovery mode)")
+                        "'morgan'/'discovery' (GPU Tanimoto via mlxmolkit)")
+    p.add_argument("--cluster-threshold", type=float, default=0.6,
+                   help="Tanimoto threshold for cluster membership (discovery mode)")
     p.add_argument("--max-per-cluster", type=int, default=20,
                    help="Cap on accepted molecules per cluster")
-    p.add_argument("--novelty-threshold", type=float, default=0.90,
-                   help="Max-cosine reject threshold against accepted bank (discovery mode)")
+    p.add_argument("--novelty-threshold", type=float, default=0.85,
+                   help="Max-Tanimoto reject threshold against accepted bank (discovery mode)")
     p.add_argument("--log-dir", default=None,
                    help="Directory to save adaptive logs (JSON)")
 
@@ -305,11 +305,11 @@ def main():
         p.error("--metal/--grouped/--fused require --backend mlx")
     if args.grouped:
         args.metal = True
-    if args.adaptive and args.mode in ("erg", "discovery"):
+    if args.adaptive and args.mode in ("morgan", "discovery"):
         try:
-            import mlx_addons.similarity  # noqa
+            import mlxmolkit  # noqa
         except ImportError:
-            p.error("--mode discovery requires mlx-addons: pip install -e '.[mlx-metal]'")
+            p.error("--mode discovery requires mlxmolkit: pip install mlxmolkit-rdkit")
 
     # Default model path per backend
     if args.model_path is None:

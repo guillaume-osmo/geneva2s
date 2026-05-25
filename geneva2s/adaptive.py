@@ -1,15 +1,16 @@
 """Adaptive inference / autodidactic exploration loop.
 
-Faithful port of the original GENEVA²S adaptive sampler, plus an ERG-based
-variant that uses pharmacophore-coherent clustering and GPU-batched novelty
-filtering for much better scaffold diversity.
+Faithful port of the original GENEVA²S adaptive sampler, plus a Morgan/Tanimoto
+discovery-mode variant that uses GPU-batched novelty filtering and online
+single-link clustering — all via mlxmolkit's existing Metal Tanimoto pipeline.
 
 Two explorer classes:
-- AdaptiveSmilesExplorer:     InChIKey-3-prefix clustering, CPU Morgan-Tanimoto.
-                              Standard library deps only (rdkit). No GPU needed.
-- ErgAdaptiveExplorer:        ERG fingerprint + online pharmacophore clustering
-                              + GPU-batched cosine novelty filter via mlx-addons.
-                              Requires `mlx-addons` for the GPU path.
+- AdaptiveSmilesExplorer:       InChIKey-3-prefix clustering, CPU Morgan-Tanimoto.
+                                Standard library deps only (rdkit). No GPU needed.
+- MorganAdaptiveExplorer:       Morgan fingerprint + online single-link clustering
+                                in Tanimoto space + GPU-batched Tanimoto novelty
+                                filter, all routed through mlxmolkit. Requires
+                                `mlxmolkit` for the GPU path.
 
 Plus a cyclic temperature schedule that matches the original.
 """
@@ -217,15 +218,15 @@ def run_adaptive(
             temperature_func=temperature_func,
             **explorer_kwargs,
         )
-    elif mode in ("erg", "discovery"):
-        explorer = ErgAdaptiveExplorer(
+    elif mode in ("morgan", "discovery"):
+        explorer = MorganAdaptiveExplorer(
             generator_func=generator_func,
             temperature_func=temperature_func,
             **explorer_kwargs,
         )
     else:
         raise ValueError(
-            f"Unknown mode {mode!r}. Expected one of: default, inchikey, erg, discovery"
+            f"Unknown mode {mode!r}. Expected one of: default, inchikey, morgan, discovery"
         )
 
     if verbose:
@@ -244,79 +245,86 @@ def run_adaptive(
 
 
 # ============================================================================
-# ERG fingerprint utilities (rdkit, CPU; cheap per-mol)
+# Morgan fingerprint utilities (uint32-packed, GPU-ready via mlxmolkit)
 # ============================================================================
 
-def compute_erg(smi: str) -> Optional[np.ndarray]:
-    """Compute the 315-dim ERG fingerprint for a SMILES. Returns None if invalid."""
-    from rdkit.Chem import rdReducedGraphs
-    mol = MolFromSmiles(smi)
-    if mol is None:
-        return None
-    return np.asarray(rdReducedGraphs.GetErGFingerprint(mol), dtype=np.float32)
+def compute_morgan_batch(smiles_list, radius: int = 2, nbits: int = 2048):
+    """Batch Morgan FP. Returns (fp_u32, idx_map) where:
+      fp_u32  : mx.array (N_valid, nwords) uint32 — Metal-ready packed bits
+      idx_map : list[int] mapping each row back to its index in smiles_list
 
+    Invalid SMILES are dropped. Empty input → (None, []).
 
-def compute_erg_batch(smiles_list) -> tuple[np.ndarray, list]:
-    """Returns (fp_matrix (N_valid, 315), index_map list[int])."""
-    fps, idx_map = [], []
+    Requires mlxmolkit (and mlx) for the uint32 packing kernel. CPU-only
+    callers should fall back to AdaptiveSmilesExplorer (InChIKey mode).
+    """
+    from mlxmolkit import morgan_fp_bytes_from_smiles, fp_uint8_to_uint32
+
+    valid_smis, idx_map = [], []
     for i, smi in enumerate(smiles_list):
-        fp = compute_erg(smi)
-        if fp is not None:
-            fps.append(fp)
+        if smi and MolFromSmiles(smi) is not None:
+            valid_smis.append(smi)
             idx_map.append(i)
-    if not fps:
-        return np.zeros((0, 315), dtype=np.float32), []
-    return np.stack(fps, axis=0), idx_map
+    if not valid_smis:
+        return None, []
+    fp_bytes = morgan_fp_bytes_from_smiles(
+        valid_smis, radius=radius, nbits=nbits, use_chirality=False
+    )
+    fp_u32 = fp_uint8_to_uint32(fp_bytes)
+    return fp_u32, idx_map
 
 
 # ============================================================================
-# ErgAdaptiveExplorer — ERG cluster + GPU novelty (via mlx-addons)
+# MorganAdaptiveExplorer — online single-link Tanimoto cluster + GPU novelty
+#                          (powered by mlxmolkit's Metal Tanimoto pipeline)
 # ============================================================================
 
-class ErgAdaptiveExplorer:
-    """Adaptive explorer with pharmacophore-coherent (ERG) clustering and
-    GPU-batched cosine novelty filtering.
+class MorganAdaptiveExplorer:
+    """Adaptive explorer with Morgan/Tanimoto clustering + GPU-batched novelty
+    filtering, all routed through mlxmolkit's Metal Tanimoto pipeline.
 
     Differences from AdaptiveSmilesExplorer:
-    - Cluster key = ERG online single-link cluster (in cosine space), not
-      InChIKey-3-prefix. Captures "same pharmacophore arrangement on a
-      different skeleton" (scaffold hops) as same cluster.
-    - Novelty filter = MLX-batched cosine sim against all-accepted bank.
-      Sub-millisecond at 10k+ accepted; matches BulkTanimotoSimilarity
-      semantics but ~100× faster on Apple Silicon.
+    - Cluster key = online single-link Butina-style cluster in Tanimoto space
+      (not InChIKey-3-prefix). Each accepted molecule joins the closest
+      centroid if Tanimoto ≥ cluster_threshold, else starts a new cluster.
+    - Novelty filter = mlxmolkit's GPU Tanimoto kernel against the accepted
+      bank. Sub-millisecond at 10k+ accepted on Apple Silicon.
 
-    Requires `mlx-addons` (`pip install mlx-addons`).
+    Requires `mlxmolkit` (`pip install mlxmolkit-rdkit`).
     """
 
     def __init__(
         self,
         generator_func: Callable,
         temperature_func: Callable = None,
-        cluster_threshold: float = 0.75,
+        cluster_threshold: float = 0.6,
         max_per_cluster: int = 20,
         max_freq: int = 2,
-        novelty_threshold: float = 0.90,
+        novelty_threshold: float = 0.85,
+        morgan_radius: int = 2,
+        morgan_nbits: int = 2048,
     ):
         try:
             import mlx.core as mx  # noqa
-            from mlx_addons.similarity import (
-                OnlineSingleLinkCluster,
-                StreamingFingerprintBank,
-                max_cosine_to_set,
-            )
+            from mlxmolkit import tanimoto_matrix_metal_u32  # noqa
         except ImportError as e:
             raise ImportError(
-                "ErgAdaptiveExplorer requires mlx and mlx-addons. "
-                "Install with: pip install 'geneva2s[mlx-metal]'"
+                "MorganAdaptiveExplorer requires mlx and mlxmolkit. "
+                "Install with: pip install 'geneva2s[discovery]'"
             ) from e
         import mlx.core as mx
+        from mlxmolkit import tanimoto_matrix_metal_u32
         self._mx = mx
-        self._max_cosine_to_set = max_cosine_to_set
+        self._tanimoto = tanimoto_matrix_metal_u32
 
         self.generator_func = generator_func
         self.temperature_func = temperature_func or (lambda r, f, c: 1.0)
+        self.cluster_threshold = cluster_threshold
+        self.max_per_cluster = max_per_cluster
         self.max_freq = max_freq
         self.novelty_threshold = novelty_threshold
+        self.morgan_radius = morgan_radius
+        self.morgan_nbits = morgan_nbits
 
         self.round = 0
         self.dataset: set = set()
@@ -324,10 +332,11 @@ class ErgAdaptiveExplorer:
         self.iteration_data: dict = defaultdict(list)
         self.generated_data: dict = defaultdict(list)
 
-        self.cluster = OnlineSingleLinkCluster(
-            threshold=cluster_threshold, max_per_cluster=max_per_cluster
-        )
-        self.fp_bank = StreamingFingerprintBank(dim=315)
+        # mx.array (N_accepted, nwords) of uint32-packed Morgan FPs (the "bank").
+        # Same for centroids. None until first accept.
+        self._bank: Optional["mx.array"] = None
+        self._centroids: Optional["mx.array"] = None
+        self._centroid_counts: list = []  # parallel to _centroids rows
 
     @staticmethod
     def _scaffold(smi: str):
@@ -336,60 +345,79 @@ class ErgAdaptiveExplorer:
         except Exception:
             return None
 
+    def _append_rows(self, current, new_rows):
+        """Concat an mx.array (N, K) with another (M, K) along axis 0. None-safe."""
+        mx = self._mx
+        if current is None:
+            return new_rows
+        return mx.concatenate([current, new_rows], axis=0)
+
     def run_round(self, n_samples: int = 1000, verbose: bool = False):
         start = time.time()
         mx = self._mx
-        temperature = self.temperature_func(self.round, self.freq, self.cluster.summary())
+        cluster_summary = {i: c for i, c in enumerate(self._centroid_counts)}
+        temperature = self.temperature_func(self.round, self.freq, cluster_summary)
         generated = self.generator_func(n_samples, temperature)
 
-        # Batched ERG computation (also a validity filter — invalid SMILES → None)
-        cand_smiles, cand_fps_np = [], []
-        for smi in generated:
-            if not smi:
-                continue
-            fp = compute_erg(smi)
-            if fp is None:
-                continue
-            cand_smiles.append(smi)
-            cand_fps_np.append(fp)
-
-        if not cand_fps_np:
+        # Batched Morgan FP (also a validity filter)
+        cand_fps_u32, idx_map = compute_morgan_batch(
+            generated, radius=self.morgan_radius, nbits=self.morgan_nbits
+        )
+        if cand_fps_u32 is None:
             if verbose:
                 print(f"[Round {self.round}] Temp: {temperature:.2f} | No valid mols")
             self.round += 1
             return
+        cand_smiles = [generated[i] for i in idx_map]
 
-        # Batched novelty: max cosine to all-accepted bank (sub-ms on GPU)
-        cand_fps = mx.array(np.stack(cand_fps_np))
-        if len(self.fp_bank) > 0:
-            max_sims = np.array(self._max_cosine_to_set(cand_fps, self.fp_bank.matrix))
+        # Batched novelty: max Tanimoto to bank (GPU, sub-ms)
+        if self._bank is not None:
+            sim_to_bank = self._tanimoto(cand_fps_u32, self._bank)
+            max_sims = np.array(sim_to_bank.max(axis=-1))
         else:
             max_sims = np.zeros(len(cand_smiles), dtype=np.float32)
 
+        # Batched cluster assignment: cand × centroids → argmax per row
+        if self._centroids is not None:
+            sim_to_cent = np.array(self._tanimoto(cand_fps_u32, self._centroids))
+        else:
+            sim_to_cent = np.zeros((len(cand_smiles), 0), dtype=np.float32)
+
         added = 0
-        accepted_fps_np = []
+        accepted_idx = []
         for i, smi in enumerate(cand_smiles):
             self.freq[smi] += 1
-            cluster_id, _ = self.cluster.assign(cand_fps_np[i])
             scaff = self._scaffold(smi)
+
+            # Decide cluster (uses centroids snapshotted at start of batch;
+            # new clusters created within this batch aren't considered until
+            # next round — acceptable for batched online sampling).
+            if sim_to_cent.shape[1] > 0:
+                best_cid = int(np.argmax(sim_to_cent[i]))
+                best_sim = float(sim_to_cent[i, best_cid])
+            else:
+                best_cid, best_sim = -1, 0.0
+
+            joins_existing = best_sim >= self.cluster_threshold
 
             accept = True
             if smi in self.dataset:
                 accept = False
-            if self.freq[smi] > self.max_freq:
+            elif self.freq[smi] > self.max_freq:
                 accept = False
-            if self.cluster.at_capacity(cluster_id):
+            elif max_sims[i] >= self.novelty_threshold:
                 accept = False
-            if max_sims[i] >= self.novelty_threshold:
+            elif joins_existing and self._centroid_counts[best_cid] >= self.max_per_cluster:
                 accept = False
 
+            cluster_id = best_cid if joins_existing else -1  # -1 = new cluster pending
             self.generated_data[self.round].append({
                 "smiles": smi,
                 "round": self.round,
                 "freq": self.freq[smi],
                 "cluster": cluster_id,
                 "scaffold": scaff,
-                "erg_max_sim": float(max_sims[i]),
+                "tanimoto_max": float(max_sims[i]),
                 "accepted": accept,
             })
 
@@ -397,38 +425,56 @@ class ErgAdaptiveExplorer:
                 continue
 
             self.dataset.add(smi)
-            self.cluster.increment(cluster_id)
+            if joins_existing:
+                self._centroid_counts[best_cid] += 1
+            else:
+                # New cluster: this fp becomes a centroid; count starts at 1.
+                self._centroid_counts.append(1)
+            accepted_idx.append(i)
             self.iteration_data[self.round].append({
                 "smiles": smi,
                 "round": self.round,
                 "freq": self.freq[smi],
-                "cluster": cluster_id,
+                "cluster": cluster_id if joins_existing else len(self._centroid_counts) - 1,
                 "scaffold": scaff,
-                "erg_max_sim": float(max_sims[i]),
+                "tanimoto_max": float(max_sims[i]),
             })
-            accepted_fps_np.append(cand_fps_np[i])
             added += 1
 
-        if accepted_fps_np:
-            self.fp_bank.add_batch(mx.array(np.stack(accepted_fps_np)))
+        # Single GPU-side concat: bank gets all accepted, centroids only the
+        # new-cluster ones (i.e. those whose best_sim < cluster_threshold).
+        if accepted_idx:
+            accepted_rows = cand_fps_u32[mx.array(accepted_idx)]
+            self._bank = self._append_rows(self._bank, accepted_rows)
+
+            new_centroid_local_idx = []
+            for local_pos, i in enumerate(accepted_idx):
+                if sim_to_cent.shape[1] == 0 or sim_to_cent[i].max() < self.cluster_threshold:
+                    new_centroid_local_idx.append(local_pos)
+            if new_centroid_local_idx:
+                new_centroid_rows = accepted_rows[mx.array(new_centroid_local_idx)]
+                self._centroids = self._append_rows(self._centroids, new_centroid_rows)
 
         if verbose:
+            n_clusters = len(self._centroid_counts)
+            bank_size = 0 if self._bank is None else int(self._bank.shape[0])
             print(
                 f"[Round {self.round}] T={temperature:.2f} | "
                 f"valid={len(cand_smiles)}/{len(generated)} | "
-                f"accepted={added} | clusters={self.cluster.n_clusters} | "
-                f"bank={len(self.fp_bank)} | time={time.time()-start:.2f}s"
+                f"accepted={added} | clusters={n_clusters} | "
+                f"bank={bank_size} | time={time.time()-start:.2f}s"
             )
         self.round += 1
 
     def save_log(self, path: str, save_all: bool = False, only_round=None):
+        cluster_counts = {i: c for i, c in enumerate(self._centroid_counts)}
         to_save = {
             "iterations": (
                 dict(self.iteration_data) if only_round is None
                 else {only_round: self.iteration_data.get(only_round, [])}
             ),
             "frequency": dict(self.freq),
-            "cluster_counts": self.cluster.summary(),
+            "cluster_counts": cluster_counts,
         }
         if save_all:
             to_save["generated"] = dict(self.generated_data)
@@ -438,3 +484,7 @@ class ErgAdaptiveExplorer:
 
     def get_dataset(self) -> list:
         return list(self.dataset)
+
+
+# Backward-compat alias (was named ErgAdaptiveExplorer in an earlier draft).
+ErgAdaptiveExplorer = MorganAdaptiveExplorer
