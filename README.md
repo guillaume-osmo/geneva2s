@@ -161,6 +161,35 @@ python bench/bench_three_frameworks.py   # reproduce
 
 **Use:** MLX fused+compile for everything inference-side on Apple Silicon, PT for training (where the bottleneck is per-step backprop, not forward dispatch).
 
+### Fused PyTorch variant (`GenevaBiLSTMFused`)
+
+A `GenevaBiLSTMFused` PyTorch class is also provided with the same grouped-LSTM
+fusion. The trade-off is opposite to MLX:
+
+| Batch | PT eager (`nn.LSTM`×4) | PT fused | Δ |
+|---|---|---|---|
+| 1 | 2.49 ms | 3.86 ms | -55% (worse) |
+| 64 | 3.09 ms | 4.44 ms | -44% (worse) |
+| 256 | 13.58 ms | 9.90 ms | **+27% better** |
+| 512 | 18.20 ms | 17.32 ms | +5% |
+
+PyTorch's `nn.LSTM` has a heavily-optimized MPS scan kernel that's faster than
+any Python time-loop replacement at small batches. At batch ≥256, the savings
+from one big input-projection matmul + grouped einsum recurrent step finally
+win. Use `GenevaBiLSTMFused` only for large-batch offline inference.
+
+### Next step: custom Metal kernel for true 2-3× speedup
+
+The fused Python variants save kernel-dispatch overhead but still issue 42
+sequential kernel launches (one per timestep). A custom Metal kernel via
+`mx.fast.metal_kernel` would compute all 42 timesteps in one launch with
+threadgroup-cooperative memory for `(h, c)`. This is the same approach as the
+in-flight MLX core PR [ml-explore/mlx#3089](https://github.com/ml-explore/mlx/pull/3089),
+which adds C++/Metal fast GRU and LSTM cells to MLX itself (1.4-1.7× speedup
+on the standard nn.LSTM). For an *application-level* version that ships as
+part of this repo (no MLX core changes), the equivalent would be ~200 lines
+of MSL + a `mx.fast.metal_kernel` wrapper. **Not yet shipped.**
+
 ## Citation
 
 If you use this code, please cite the original GEN paper:
