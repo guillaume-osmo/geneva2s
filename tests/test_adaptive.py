@@ -149,8 +149,86 @@ class TestMorganAdaptiveExplorer:
         # Only the first occurrence accepted (subsequent rejected by dup/freq cap)
         assert len(e.get_dataset()) == 1
 
-    def test_backcompat_alias_present(self):
-        # ErgAdaptiveExplorer is kept as an alias for MorganAdaptiveExplorer
-        # to avoid breaking any external imports from the earlier draft.
+    def test_morgan_and_erg_are_distinct_classes(self):
+        # ErgAdaptiveExplorer is now a real ERG-based class (not an alias).
         from geneva2s.adaptive import ErgAdaptiveExplorer, MorganAdaptiveExplorer
-        assert ErgAdaptiveExplorer is MorganAdaptiveExplorer
+        assert ErgAdaptiveExplorer is not MorganAdaptiveExplorer
+
+
+# ============================================================================
+# ERG fingerprint utilities + ErgAdaptiveExplorer
+# ============================================================================
+
+@pytest.mark.skipif(not _HAS_MLXMOLKIT, reason="mlxmolkit not installed")
+class TestComputeErgBatch:
+    def test_invalid_dropped(self):
+        from geneva2s.adaptive import compute_erg_batch
+
+        fp, idx = compute_erg_batch(["CCO", "not_a_smiles_xx", _DRUGLIKE[0]])
+        assert fp is not None
+        assert fp.shape == (2, 315)
+        assert idx == [0, 2]
+
+    def test_empty_input_returns_none(self):
+        from geneva2s.adaptive import compute_erg_batch
+
+        fp, idx = compute_erg_batch([])
+        assert fp is None
+        assert idx == []
+
+    def test_all_invalid_returns_none(self):
+        from geneva2s.adaptive import compute_erg_batch
+
+        fp, idx = compute_erg_batch(["not_a", "still_bad"])
+        assert fp is None
+        assert idx == []
+
+
+@pytest.mark.skipif(not _HAS_MLXMOLKIT, reason="mlxmolkit not installed")
+class TestErgAdaptiveExplorer:
+    def test_accepts_distinct_druglike(self):
+        from geneva2s.adaptive import ErgAdaptiveExplorer
+
+        def gen(n, t):
+            return _DRUGLIKE[:n] if n <= len(_DRUGLIKE) else _DRUGLIKE
+
+        # Tight cluster threshold so each distinct pharmacophore opens its own
+        # cluster; very high novelty threshold so the cosine filter doesn't fire.
+        e = ErgAdaptiveExplorer(
+            generator_func=gen,
+            cluster_threshold=0.95,
+            max_per_cluster=10,
+            max_freq=10,
+            novelty_threshold=0.9999,
+        )
+        e.run_round(n_samples=len(_DRUGLIKE), verbose=False)
+        # Most/all distinct druglike SMILES should be accepted.
+        assert len(e.get_dataset()) >= len(_DRUGLIKE) - 2
+
+    def test_rejects_repeats(self):
+        from geneva2s.adaptive import ErgAdaptiveExplorer
+
+        def gen(n, t): return [_DRUGLIKE[0]] * n
+
+        e = ErgAdaptiveExplorer(generator_func=gen, max_freq=2)
+        e.run_round(n_samples=5, verbose=False)
+        # Only the first occurrence accepted (subsequent rejected by dup/freq cap)
+        assert len(e.get_dataset()) == 1
+
+    def test_run_adaptive_erg_mode_dispatches(self):
+        from geneva2s.adaptive import run_adaptive, ErgAdaptiveExplorer
+
+        def gen(n, t):
+            return _DRUGLIKE[:n] if n <= len(_DRUGLIKE) else _DRUGLIKE
+
+        explorer = run_adaptive(
+            generator_func=gen,
+            n_rounds=1,
+            n_samples_per_round=len(_DRUGLIKE),
+            mode="erg",
+            verbose=False,
+            max_freq=10,
+            novelty_threshold=0.9999,
+            cluster_threshold=0.95,
+        )
+        assert isinstance(explorer, ErgAdaptiveExplorer)
