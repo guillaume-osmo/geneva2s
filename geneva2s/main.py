@@ -1,6 +1,6 @@
 """End-to-end GENEVA²S training + (adaptive) generation orchestrator.
 
-Three backends, two inference modes:
+Three backends, three adaptive-inference modes:
 
     --backend torch         (default; PyTorch + MPS)
     --backend tf            (TensorFlow 2.15 + Metal)
@@ -9,6 +9,8 @@ Three backends, two inference modes:
     --adaptive              run the autodidactic round-based loop
     --mode default          InChIKey-3-prefix clustering (CPU, fast)
     --mode discovery        Morgan/Tanimoto clustering (GPU via mlxmolkit)
+    --mode erg              ERG fingerprint + cosine (pharmacophore-coherent;
+                            scaffold-hop aware; GPU via mlxmolkit)
 
 Quick start:
 
@@ -18,6 +20,10 @@ Quick start:
     # adaptive discovery mode, MLX + grouped Metal kernel
     python -m geneva2s.main --backend mlx --grouped --adaptive \\
         --rounds 5 --n-generate 1000 --mode discovery
+
+    # adaptive ERG mode (scaffold-hop aware), MLX
+    python -m geneva2s.main --backend mlx --grouped --adaptive \\
+        --rounds 5 --n-generate 1000 --mode erg
 
     # TF backend, one-shot
     python -m geneva2s.main --backend tf --skip-train --n-generate 500
@@ -71,10 +77,15 @@ def _generation_phase(args, generator_func, train_canonical, label: str):
         print(f"\nadaptive generation — mode={args.mode}, rounds={args.rounds}, "
               f"{args.n_generate}/round")
         t0 = time.time()
-        # Map CLI --mode to adaptive.run_adaptive's mode strings
-        mode = "discovery" if args.mode in ("morgan", "discovery") else "default"
+        # Map CLI --mode to adaptive.run_adaptive's mode strings.
+        if args.mode == "erg":
+            mode = "erg"
+        elif args.mode in ("morgan", "discovery"):
+            mode = "discovery"
+        else:
+            mode = "default"
         explorer_kwargs = {}
-        if mode == "discovery":
+        if mode in ("discovery", "erg"):
             explorer_kwargs.update(
                 cluster_threshold=args.cluster_threshold,
                 max_per_cluster=args.max_per_cluster,
@@ -269,16 +280,19 @@ def main():
                    help="Run adaptive (round-based) inference instead of one-shot")
     p.add_argument("--rounds", type=int, default=5,
                    help="Number of adaptive rounds (default 5)")
-    p.add_argument("--mode", choices=["default", "inchikey", "morgan", "discovery"],
+    p.add_argument("--mode", choices=["default", "inchikey", "morgan", "discovery", "erg"],
                    default="default",
-                   help="Adaptive clustering: 'default'/'inchikey' (CPU, fast) or "
-                        "'morgan'/'discovery' (GPU Tanimoto via mlxmolkit)")
-    p.add_argument("--cluster-threshold", type=float, default=0.6,
-                   help="Tanimoto threshold for cluster membership (discovery mode)")
+                   help="Adaptive clustering: 'default'/'inchikey' (CPU, fast), "
+                        "'morgan'/'discovery' (GPU Tanimoto via mlxmolkit), or "
+                        "'erg' (ERG FP + GPU cosine, scaffold-hop aware; mlxmolkit>=0.5.0)")
+    p.add_argument("--cluster-threshold", type=float, default=None,
+                   help="Cluster-membership threshold (discovery/erg). "
+                        "Default 0.6 for Tanimoto (discovery), 0.75 for cosine (erg).")
     p.add_argument("--max-per-cluster", type=int, default=20,
                    help="Cap on accepted molecules per cluster")
-    p.add_argument("--novelty-threshold", type=float, default=0.85,
-                   help="Max-Tanimoto reject threshold against accepted bank (discovery mode)")
+    p.add_argument("--novelty-threshold", type=float, default=None,
+                   help="Max-similarity reject threshold against accepted bank "
+                        "(discovery/erg). Default 0.85 (Tanimoto) / 0.95 (cosine).")
     p.add_argument("--log-dir", default=None,
                    help="Directory to save adaptive logs (JSON)")
 
@@ -305,11 +319,24 @@ def main():
         p.error("--metal/--grouped/--fused require --backend mlx")
     if args.grouped:
         args.metal = True
-    if args.adaptive and args.mode in ("morgan", "discovery"):
+    if args.adaptive and args.mode in ("morgan", "discovery", "erg"):
         try:
             import mlxmolkit  # noqa
         except ImportError:
-            p.error("--mode discovery requires mlxmolkit: pip install mlxmolkit-rdkit")
+            p.error(f"--mode {args.mode} requires mlxmolkit: pip install mlxmolkit-rdkit")
+        if args.mode == "erg":
+            try:
+                from mlxmolkit.erg_features import erg_fp_from_smiles  # noqa
+                from mlxmolkit.cosine_dense import cosine_matrix_dense  # noqa
+            except ImportError:
+                p.error("--mode erg requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
+                        "Upgrade with: pip install -U mlxmolkit-rdkit")
+
+    # Threshold defaults: Tanimoto for morgan/discovery, cosine for erg.
+    if args.cluster_threshold is None:
+        args.cluster_threshold = 0.75 if args.mode == "erg" else 0.6
+    if args.novelty_threshold is None:
+        args.novelty_threshold = 0.95 if args.mode == "erg" else 0.85
 
     # Default model path per backend
     if args.model_path is None:
