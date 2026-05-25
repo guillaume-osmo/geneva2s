@@ -207,6 +207,29 @@ from a research branch. They live in
 `mlx_addons.recurrent`, so the kernels are reusable for any LSTM workload,
 not just this generator.
 
+### Training with the Metal kernels
+
+Both `MetalLSTM` and the kernel-level `metal_lstm_scan` are now **fully
+differentiable** — `mx.grad(model)` flows through the Metal kernels via a
+hand-written VJP kernel + `mx.custom_function` wiring. Gradients match
+autograd through a pure-MLX reference LSTM to within float32 epsilon (max
+rel error ~3e-7).
+
+Training-time (forward + backward) speedup vs `mlx.nn.LSTM` on Apple M4 Pro:
+
+| Batch | pure-MLX fwd+bwd | Metal+VJP fwd+bwd | Speedup |
+|---|---|---|---|
+| 1 | 6.62 ms | 3.04 ms | **2.18×** |
+| 16 | 6.62 ms | 3.65 ms | **1.81×** |
+| 64 | 7.83 ms | 4.30 ms | **1.82×** |
+| 256 | 13.88 ms | 11.03 ms | 1.26× |
+| 512 | 24.78 ms | 22.38 ms | 1.11× |
+
+Training-mode speedup tracks the forward-only inference speedup almost
+exactly — confirming the VJP kernel is correctly sized. For a 11-min
+80-epoch PyTorch training run, the MLX equivalent should land around
+~6 min once the full pipeline (optimiser, data loader, etc.) is wired.
+
 ## Citation
 
 If you use this code, please cite the original GEN paper:
