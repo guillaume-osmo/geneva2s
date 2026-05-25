@@ -178,17 +178,34 @@ any Python time-loop replacement at small batches. At batch ≥256, the savings
 from one big input-projection matmul + grouped einsum recurrent step finally
 win. Use `GenevaBiLSTMFused` only for large-batch offline inference.
 
-### Next step: custom Metal kernel for true 2-3× speedup
+### Custom Metal LSTM kernel via `mlx-addons`
 
-The fused Python variants save kernel-dispatch overhead but still issue 42
-sequential kernel launches (one per timestep). A custom Metal kernel via
-`mx.fast.metal_kernel` would compute all 42 timesteps in one launch with
-threadgroup-cooperative memory for `(h, c)`. This is the same approach as the
-in-flight MLX core PR [ml-explore/mlx#3089](https://github.com/ml-explore/mlx/pull/3089),
-which adds C++/Metal fast GRU and LSTM cells to MLX itself (1.4-1.7× speedup
-on the standard nn.LSTM). For an *application-level* version that ships as
-part of this repo (no MLX core changes), the equivalent would be ~200 lines
-of MSL + a `mx.fast.metal_kernel` wrapper. **Not yet shipped.**
+Shipped! `pip install mlx-addons` adds two extra variants:
+
+- `GenevaBiLSTMMLXMetal` — replaces every `mlx.nn.LSTM` call with a fused
+  Metal kernel (single-LSTM cell, fast or precise math toggle).
+- `GenevaBiLSTMMLXMetalGrouped` — combines the Metal cell with the
+  grouped-branches idea: biLSTM uses single Metal LSTM, the 4 second-layer
+  branches use a *grouped* Metal cell kernel that computes all 4 branches in
+  one kernel launch per timestep.
+
+Variant comparison with `mx.compile`:
+
+| Batch | base+cmp | fused+cmp | metal+cmp | **metal-grouped+cmp** |
+|---|---|---|---|---|
+| 1   | 6.90 ms | 4.27 | 5.17 | **3.42** (2.02× baseline) |
+| 16  | 7.26 | 4.54 | 6.09 | **3.89** (1.87×) |
+| 64  | 8.15 | 4.95 | 6.76 | **4.61** (1.77×) |
+| 256 | 9.30 | 8.23 | 8.40 | 8.41 (compute-bound; matmuls dominate) |
+| 512 | 13.82 | 12.34 | 13.94 | 13.42 |
+
+The Metal kernels are derived from PR
+[ml-explore/mlx#3089](https://github.com/ml-explore/mlx/pull/3089) plus
+later tuning (`pick_threads_per_group` heuristic, precise/fast math toggle)
+from a research branch. They live in
+[mlx-addons](https://github.com/guillaume-osmo/mlx-addons) under
+`mlx_addons.recurrent`, so the kernels are reusable for any LSTM workload,
+not just this generator.
 
 ## Citation
 
