@@ -29,6 +29,7 @@ source .venv/bin/activate
 uv pip install -e ".[tests]"
 uv pip install "torch==2.12" "tensorflow==2.15.1" "tensorflow-metal==1.1.0" "mlx>=0.20"
 uv pip install --force-reinstall --no-deps git+https://github.com/guillaume-osmo/mlx-addons.git@main
+uv pip install --force-reinstall --no-deps git+https://github.com/guillaume-osmo/mlxmolkit.git@main
 ```
 
 If you have local RDKit/OpenBabel overrides in your shell, run commands with a

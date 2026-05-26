@@ -12,6 +12,10 @@ Three backends, three adaptive-inference modes:
     --mode erg              ERG fingerprint + cosine (pharmacophore-coherent;
                             scaffold-hop aware; GPU via mlxmolkit)
 
+    --optimizer adam        Keras-parity default
+              adamuonn      MuonN matrix + AdamN scalar (recommended on M3 Max)
+    --augment 5             reproduce the 2019 naug_5x training corpus
+
 Quick start:
 
     # one-shot generation, PyTorch
@@ -37,12 +41,23 @@ from pathlib import Path
 import numpy as np
 
 from .tokenizer import CharTokenizer
-from .utils import canonicalize, sanity_check
+from .utils import augment_corpus, canonicalize, sanity_check
 
 
-def _load_corpus(path: str):
+def _load_corpus(path: str, augment: int = 1, verbose: bool = True):
+    """Load a SMILES corpus and optionally expand it via random-walk augmentation.
+
+    augment=1 keeps the canonical form only (= the original geneva2s behavior).
+    augment=5 reproduces Chembl24_9k_organic_naug_5x.smi (5× variants per mol),
+    which is what the 2019 Smiles-GEN paper trained on and what the Keras/DPO
+    checkpoints used. n_aug > 1 trades startup cost for higher validity.
+    """
     with open(path) as f:
         raw = [line.strip() for line in f if line.strip()]
+    if augment > 1:
+        if verbose:
+            print(f"  augmenting corpus {augment}× via random-walk SMILES variants...")
+        raw = augment_corpus(raw, n_aug=augment)
     train_canonical = set(c for c in (canonicalize(s) for s in raw) if c)
     return raw, train_canonical
 
@@ -70,7 +85,46 @@ def _print_score(s, label=""):
     print(f"  novel:       {s['novel']}  ({100*s['novel']/max(1,s['total']):.2f}% of generated)")
 
 
-def _generation_phase(args, generator_func, train_canonical, label: str):
+def _resolve_resume_path(arg_value: str, log_dir: str, label: str) -> str:
+    """Resolve --resume-from-log to a concrete file path.
+
+    - exact file path → returned as-is
+    - "latest" or a directory → newest `adaptive_<label>_*.json` in that
+      directory (or `--log-dir`, or `./logs`)
+    """
+    if not arg_value:
+        return None
+    p = Path(arg_value)
+    if p.is_file():
+        return str(p)
+    if str(p).lower() == "latest" or p.is_dir():
+        search_dir = p if p.is_dir() else Path(log_dir or "logs")
+        if not search_dir.is_dir():
+            raise FileNotFoundError(
+                f"--resume-from-log {arg_value!r}: no such directory {search_dir}"
+            )
+        prefix = f"adaptive_{label.lower()}"
+        candidates = sorted(
+            (c for c in search_dir.glob(f"{prefix}*.json")),
+            key=lambda x: x.stat().st_mtime, reverse=True,
+        )
+        if not candidates:
+            # Be lenient — also accept any adaptive_*.json if backend-specific
+            # ones aren't found (helps when resuming across backend renames).
+            candidates = sorted(
+                search_dir.glob("adaptive_*.json"),
+                key=lambda x: x.stat().st_mtime, reverse=True,
+            )
+        if not candidates:
+            raise FileNotFoundError(
+                f"--resume-from-log {arg_value!r}: no adaptive_*.json found in {search_dir}"
+            )
+        return str(candidates[0])
+    raise FileNotFoundError(f"--resume-from-log {arg_value!r}: not a file or directory")
+
+
+def _generation_phase(args, generator_func, train_canonical, label: str,
+                      after_round=None):
     """Run either one-shot or adaptive generation given a backend's gen function."""
     if args.adaptive:
         from .adaptive import run_adaptive
@@ -96,14 +150,28 @@ def _generation_phase(args, generator_func, train_canonical, label: str):
                 use_cluster=True,
                 max_cluster=args.max_per_cluster,
             )
-        log_path = (Path(args.log_dir) / f"adaptive_{label.lower()}.json"
+        log_stem = args.log_name or f"adaptive_{label.lower()}_{time.strftime('%Y%m%d_%H%M%S')}"
+        log_path = (Path(args.log_dir) / f"{log_stem}.json"
                     if args.log_dir else None)
+        if log_path:
+            print(f"  log will be written to: {log_path}")
+        resolved_resume = _resolve_resume_path(
+            args.resume_from_log, args.log_dir, label,
+        )
+        if resolved_resume:
+            print(f"  resuming from log: {resolved_resume}")
         explorer = run_adaptive(
             generator_func=generator_func,
             n_rounds=args.rounds,
             n_samples_per_round=args.n_generate,
             mode=mode,
+            reference_canonical=train_canonical,
+            auto_erg_switch=args.auto_erg_switch,
+            auto_erg_drop=args.auto_erg_drop,
+            auto_erg_patience=args.auto_erg_patience,
             save_log_path=str(log_path) if log_path else None,
+            after_round=after_round,
+            resume_log=resolved_resume,
             **explorer_kwargs,
         )
         gen_time = time.time() - t0
@@ -151,6 +219,8 @@ def _run_pytorch(args, raw, train_canonical):
         t0 = time.time()
         fit_best(model, X, y, device, tok, text,
                  num_epochs=args.epochs, batch_size=args.batch_size,
+                 lr=args.lr, optimizer=args.optimizer,
+                 weight_decay=args.weight_decay,
                  check_every=args.check_every, save_path=args.model_path)
         print(f"  trained in {time.time()-t0:.1f}s -> {args.model_path}")
     else:
@@ -227,6 +297,9 @@ def _run_mlx(args, raw, train_canonical):
     model = cls(tok.vocab_size)
     if not args.skip_train:
         X, y = tok.sliding_window(text)
+        if args.optimizer != "adam":
+            print(f"  note: --optimizer {args.optimizer} is torch-only for now; "
+                  f"MLX backend uses mlx.optimizers.Adam.")
         print(f"training {args.epochs} epochs on X={X.shape}...")
         t0 = time.time()
         fit_best(model, X, y, tok, text,
@@ -239,10 +312,29 @@ def _run_mlx(args, raw, train_canonical):
         load_state(model, args.model_path)
         print(f"loaded {args.model_path}")
 
-    def gen_fn(n, _temp):
-        return predict_batch_seeds(model, tok, text, ncollect=n, ncopies=args.ncopies)
+    # Dynamic seed corpus — `text` grows each round with newly accepted SMILES
+    # (mirrors the 2025 EVA `update_training_text_with_generated` + `Utils.Encode`
+    # loop, which is what actually drives the seed-window distribution since
+    # `_PredictBatchSeeds` samples from the encoded text — `seed_smiles_pool`
+    # in 2025 was dead code on the sampling path).
+    text_state = {"text": text}
 
-    return _generation_phase(args, gen_fn, train_canonical, "MLX")
+    def gen_fn(n, _temp):
+        return predict_batch_seeds(
+            model, tok, text_state["text"],
+            ncollect=n, ncopies=args.ncopies,
+        )
+
+    def _extend_corpus(explorer, round_idx):
+        new = [row["smiles"] for row in explorer.iteration_data.get(round_idx, [])]
+        if not new:
+            return
+        addition = tok.prepare_corpus(new)
+        if addition:
+            text_state["text"] = text_state["text"] + addition
+
+    return _generation_phase(args, gen_fn, train_canonical, "MLX",
+                              after_round=_extend_corpus)
 
 
 # ----------------------------------------------------------------------------
@@ -267,6 +359,20 @@ def main():
     p.add_argument("--epochs", type=int, default=80)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--check-every", type=int, default=5)
+    p.add_argument("--lr", type=float, default=3e-3,
+                   help="Learning rate (Keras-parity default 3e-3)")
+    p.add_argument("--weight-decay", type=float, default=0.0,
+                   help="Weight decay (passed to AdamW / Muon family; 0 for plain Adam)")
+    p.add_argument("--optimizer",
+                   choices=["adam", "adamw", "adamn",
+                            "muon", "adamuon", "adamuonn",
+                            "adamuon_official", "muon_vx"],
+                   default="adam",
+                   help="Optimizer for PyTorch training. 'adam' = Keras-parity default; "
+                        "'adamuonn' = MuonN matrix + AdamN scalar (recommended on M3 Max)")
+    p.add_argument("--augment", type=int, default=1,
+                   help="Per-molecule random-walk SMILES variants. "
+                        "1 = canonical only (default); 5 = reproduce the 2019 naug_5x corpus")
     p.add_argument("--skip-train", action="store_true")
     p.add_argument("--model-path", default=None)
 
@@ -288,13 +394,33 @@ def main():
     p.add_argument("--cluster-threshold", type=float, default=None,
                    help="Cluster-membership threshold (discovery/erg). "
                         "Default 0.6 for Tanimoto (discovery), 0.75 for cosine (erg).")
-    p.add_argument("--max-per-cluster", type=int, default=20,
-                   help="Cap on accepted molecules per cluster")
+    p.add_argument("--max-per-cluster", type=int, default=20_000,
+                   help="Cap on accepted molecules per cluster "
+                        "(2025 EVA used 20000; the prior default of 20 caused "
+                        "early saturation in default/InChIKey mode)")
     p.add_argument("--novelty-threshold", type=float, default=None,
                    help="Max-similarity reject threshold against accepted bank "
                         "(discovery/erg). Default 0.85 (Tanimoto) / 0.95 (cosine).")
+    p.add_argument("--auto-erg-switch", action="store_true",
+                   help="Default/inchikey only: switch to ERG if accepted and novelty "
+                        "both drop for 2 consecutive rounds")
+    p.add_argument("--auto-erg-drop", type=float, default=0.01,
+                   help="Minimum round-over-round drop required to trigger auto ERG "
+                        "(default: 0.01 = 1 percentage point)")
+    p.add_argument("--auto-erg-patience", type=int, default=2,
+                   help="Number of consecutive down rounds required before switching")
     p.add_argument("--log-dir", default=None,
                    help="Directory to save adaptive logs (JSON)")
+    p.add_argument("--log-name", default=None,
+                   help="Base filename for the run log (no .json). Default: "
+                        "adaptive_<backend>_<YYYYMMDD_HHMMSS> — timestamped so "
+                        "parallel/successive runs don't overwrite each other.")
+    p.add_argument("--resume-from-log", default=None,
+                   help="Path to a prior adaptive log JSON to resume from. "
+                        "Loads iteration_data/freq/cluster_counts/dataset, "
+                        "replays after_round to rebuild the dynamic seed corpus, "
+                        "and continues at round=max(saved)+1. Supports "
+                        "--mode default/inchikey only.")
 
     # MLX-specific model variant flags
     p.add_argument("--metal", action="store_true",
@@ -323,14 +449,32 @@ def main():
         try:
             import mlxmolkit  # noqa
         except ImportError:
-            p.error(f"--mode {args.mode} requires mlxmolkit: pip install mlxmolkit-rdkit")
+            p.error(
+                f"--mode {args.mode} requires mlxmolkit from GitHub: "
+                "uv pip install --force-reinstall --no-deps "
+                "git+https://github.com/guillaume-osmo/mlxmolkit.git@main"
+            )
         if args.mode == "erg":
             try:
                 from mlxmolkit.erg_features import erg_fp_from_smiles  # noqa
                 from mlxmolkit.cosine_dense import cosine_matrix_dense  # noqa
             except ImportError:
-                p.error("--mode erg requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
-                        "Upgrade with: pip install -U mlxmolkit-rdkit")
+                p.error(
+                    "--mode erg requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
+                    "Upgrade from GitHub with: uv pip install --force-reinstall --no-deps "
+                    "git+https://github.com/guillaume-osmo/mlxmolkit.git@main"
+                )
+    if args.auto_erg_switch:
+        try:
+            import mlxmolkit  # noqa
+            from mlxmolkit.erg_features import erg_fp_from_smiles  # noqa
+            from mlxmolkit.cosine_dense import cosine_matrix_dense  # noqa
+        except ImportError:
+            p.error(
+                "--auto-erg-switch requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
+                "Install from GitHub with: uv pip install --force-reinstall --no-deps "
+                "git+https://github.com/guillaume-osmo/mlxmolkit.git@main"
+            )
 
     # Threshold defaults: Tanimoto for morgan/discovery, cosine for erg.
     if args.cluster_threshold is None:
@@ -349,7 +493,7 @@ def main():
         else:
             args.model_path = str(repo_root / "models" / "geneva2s_torch.pt")
 
-    raw, train_canonical = _load_corpus(args.smi)
+    raw, train_canonical = _load_corpus(args.smi, augment=args.augment)
     print(f"corpus: {len(raw)} input SMILES, {len(train_canonical)} canonical unique")
 
     if args.backend == "mlx":

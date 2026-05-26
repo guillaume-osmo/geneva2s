@@ -41,6 +41,31 @@ def augment_smiles(smi: str, n_aug: int = 5, maxiter: int = 50) -> list:
     return list(out)
 
 
+def augment_corpus(smiles_list, n_aug: int = 5, maxiter: int = 50) -> list:
+    """Expand each SMILES in the corpus to up to n_aug random-order variants.
+
+    This is the corpus-level wrapper around `augment_smiles` that reproduces the
+    naug_5x training corpora from the original Smiles-GEN dataset
+    (e.g. Chembl24_9k_organic_naug_5x.smi). With n_aug=5 and a 9k corpus the
+    augmented corpus is ~5× larger and dramatically improves validity.
+
+    Invalid SMILES are silently dropped. Output preserves the per-molecule
+    grouping (variants of mol i appear contiguously).
+    """
+    if n_aug <= 1:
+        # n_aug=1 keeps just the canonical form for each valid input.
+        out = []
+        for smi in smiles_list:
+            can = canonicalize(smi)
+            if can:
+                out.append(can)
+        return out
+    out = []
+    for smi in smiles_list:
+        out.extend(augment_smiles(smi, n_aug=n_aug, maxiter=maxiter))
+    return out
+
+
 def sanity_check(s: str) -> bool:
     """Original SmilesGEN_generator.SanityCheck — text-based: balanced
     parens, brackets, ring digits. Does NOT check chemistry."""

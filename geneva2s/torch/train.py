@@ -1,11 +1,17 @@
 """Training loop matching Keras: Adam(lr=3e-3, eps=1e-7), categorical CE.
+
 fit_best optionally tracks the highest-validity epoch and restores those weights
-(equivalent to the OnlineGenerator + restore_best_weights=True callback)."""
+(equivalent to the OnlineGenerator + restore_best_weights=True callback).
+
+The optimizer can be swapped via the `optimizer` arg (default "adam" for
+Keras-parity; pass "adamuonn" for the Muon-N + AdamN combo benchmarked on M3 Max).
+"""
 from __future__ import annotations
 
 import copy
 import os
 import time
+import types
 
 import torch
 import torch.nn as nn
@@ -14,6 +20,16 @@ from torch.utils.data import DataLoader, TensorDataset
 from ..tokenizer import CharTokenizer
 from ..utils import sanity_check
 from .generate import predict_batch_seeds
+from .optimizers import build_optimizer
+
+
+def _make_optimizer(model, *, optimizer: str, lr: float, weight_decay: float = 0.0,
+                    extra: dict | None = None):
+    """Wrap build_optimizer with a SimpleNamespace shim (args-style API)."""
+    cfg = {"optimizer": optimizer, "lr": lr, "weight_decay": weight_decay}
+    if extra:
+        cfg.update(extra)
+    return build_optimizer(model, types.SimpleNamespace(**cfg))
 
 
 def fit(
@@ -24,6 +40,8 @@ def fit(
     num_epochs: int = 80,
     batch_size: int = 256,
     lr: float = 3e-3,
+    optimizer: str = "adam",
+    weight_decay: float = 0.0,
     save_path: str = None,
     verbose: bool = True,
 ):
@@ -33,7 +51,7 @@ def fit(
         num_workers=0, pin_memory=(device.type == "cuda"),
     )
     model.to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-7)
+    opt = _make_optimizer(model, optimizer=optimizer, lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss()
 
     history = []
@@ -71,6 +89,8 @@ def fit_best(
     num_epochs: int = 80,
     batch_size: int = 256,
     lr: float = 3e-3,
+    optimizer: str = "adam",
+    weight_decay: float = 0.0,
     check_every: int = 5,
     ncollect_check: int = 500,
     ncopies_check: int = 20,
@@ -85,7 +105,7 @@ def fit_best(
         num_workers=0, pin_memory=(device.type == "cuda"),
     )
     model.to(device)
-    opt = torch.optim.Adam(model.parameters(), lr=lr, eps=1e-7)
+    opt = _make_optimizer(model, optimizer=optimizer, lr=lr, weight_decay=weight_decay)
     loss_fn = nn.CrossEntropyLoss()
 
     best_val, best_state, best_epoch = -1.0, None, -1

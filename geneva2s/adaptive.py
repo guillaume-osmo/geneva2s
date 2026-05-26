@@ -37,6 +37,35 @@ from .utils import canonicalize, get_inchikey_prefix, is_valid_molecule
 
 
 # ============================================================================
+# Per-round memory snapshot (process RSS + MLX active/peak)
+# ============================================================================
+
+def _reset_round_peak() -> None:
+    try:
+        import mlx.core as mx
+        mx.reset_peak_memory()
+    except Exception:
+        pass
+
+
+def _mem_snapshot() -> str:
+    """Compact per-round memory line: process RSS + MLX active + MLX peak-this-round."""
+    try:
+        import psutil
+        rss_mb = psutil.Process().memory_info().rss / (1024 * 1024)
+        rss = f"{rss_mb:,.0f}MB"
+    except Exception:
+        rss = "?"
+    try:
+        import mlx.core as mx
+        active = mx.get_active_memory() / (1024 * 1024)
+        peak = mx.get_peak_memory() / (1024 * 1024)
+        return f"rss={rss} | mlx_active={active:,.0f}MB | mlx_peak={peak:,.0f}MB"
+    except Exception:
+        return f"rss={rss}"
+
+
+# ============================================================================
 # Cyclic temperature schedule (matches original GEN code)
 # ============================================================================
 
@@ -47,6 +76,43 @@ def adaptive_temperature(round_idx: int, freq_counter=None, cluster_counter=None
     the adaptive loop from getting stuck.
     """
     return [1.5, 1.2, 1.0, 0.8, 0.6][round_idx % 5]
+
+
+def should_switch_to_erg(history, drop_threshold: float = 0.01, patience: int = 2) -> bool:
+    """Return True when accepted and novelty both fall for `patience` rounds."""
+    if patience < 1 or len(history) < patience + 1:
+        return False
+
+    recent = history[-(patience + 1):]
+    for prev, curr in zip(recent, recent[1:]):
+        accepted_drop = prev["accepted_rate"] - curr["accepted_rate"]
+        novelty_drop = prev["novelty_rate"] - curr["novelty_rate"]
+        if accepted_drop <= drop_threshold or novelty_drop <= drop_threshold:
+            return False
+    return True
+
+
+def _round_metrics(explorer, round_idx: int, n_samples: int, reference_canonical=None):
+    accepted = explorer.iteration_data.get(round_idx, [])
+    accepted_rate = len(accepted) / max(1, n_samples)
+
+    if reference_canonical is None:
+        novel_count = len(accepted)
+    else:
+        novel_count = sum(
+            1
+            for row in accepted
+            if canonicalize(row["smiles"]) not in reference_canonical
+        )
+
+    novelty_rate = novel_count / max(1, n_samples)
+    return {
+        "round": round_idx,
+        "accepted": len(accepted),
+        "accepted_rate": accepted_rate,
+        "novel": novel_count,
+        "novelty_rate": novelty_rate,
+    }
 
 
 # ============================================================================
@@ -112,6 +178,7 @@ class AdaptiveSmilesExplorer:
 
     def run_round(self, n_samples: int = 1000, verbose: bool = False):
         start = time.time()
+        _reset_round_peak()
         temperature = self.temperature_func(self.round, self.freq, self.cluster_counts)
         generated = self.generator_func(n_samples, temperature)
         added = 0
@@ -164,7 +231,8 @@ class AdaptiveSmilesExplorer:
         if verbose:
             print(
                 f"[Round {self.round}] Temp: {temperature:.2f} | "
-                f"Added: {added}/{n_samples} | Time: {time.time()-start:.2f}s"
+                f"Added: {added}/{n_samples} | Time: {time.time()-start:.2f}s | "
+                f"{_mem_snapshot()}"
             )
         self.round += 1
 
@@ -191,6 +259,76 @@ class AdaptiveSmilesExplorer:
 # Top-level run_adaptive — backend-agnostic adaptive sampling loop
 # ============================================================================
 
+def _resume_explorer(explorer, log_path: str, verbose: bool = True) -> int:
+    """Hydrate an explorer from a previous `save_log` JSON.
+
+    Restores `iteration_data`, `freq`, and `dataset` for any explorer type.
+    Then reconstructs mode-specific state from the accepted SMILES:
+
+    - `AdaptiveSmilesExplorer`: `cluster_counts` (InChIKey-3 prefix Counter)
+      is recomputed from the loaded SMILES, so a log written by a *different*
+      explorer (e.g. one that auto-switched to ERG mid-run) can still be
+      resumed in `default` mode coherently.
+    - `ErgAdaptiveExplorer`: `_centroids` and `_centroid_counts` are rebuilt
+      via `seed_dataset(all_accepted)`, which computes ERG FPs and seeds the
+      centroid bank (bounded by `max_centroids`). The original `cluster_counts`
+      integer indices in the saved JSON are not directly reusable since the
+      centroid identities change after re-seeding.
+    - `MorganAdaptiveExplorer`: not supported (would need an analogous
+      `seed_dataset` that recomputes Morgan FPs).
+
+    Sets `explorer.round = max(saved_rounds) + 1`. Returns that round number
+    so callers can replay any `after_round` callbacks per-round to rebuild
+    dynamic seed/text state.
+    """
+    with open(log_path) as f:
+        data = json.load(f)
+    iters = data.get("iterations") or {}
+    if not iters:
+        if verbose:
+            print(f"  resume: log {log_path} has no `iterations`; ignoring")
+        return 0
+
+    explorer.iteration_data = defaultdict(list, {
+        int(k): list(v) for k, v in iters.items()
+    })
+    explorer.freq = Counter(data.get("frequency", {}))
+
+    all_smiles = []
+    for r in sorted(explorer.iteration_data):
+        for row in explorer.iteration_data[r]:
+            smi = row.get("smiles")
+            if smi:
+                all_smiles.append(smi)
+                explorer.dataset.add(smi)
+
+    if isinstance(explorer, AdaptiveSmilesExplorer):
+        prefixes = Counter()
+        for smi in all_smiles:
+            p = get_inchikey_prefix(smi)
+            if p:
+                prefixes[p] += 1
+        explorer.cluster_counts = prefixes
+    elif isinstance(explorer, ErgAdaptiveExplorer):
+        if verbose:
+            print(f"  resume: reseeding ERG centroids from {len(all_smiles):,} accepted SMILES "
+                  f"(capped at max_centroids={explorer.max_centroids:,}) ...")
+        explorer.seed_dataset(all_smiles)
+    else:
+        raise NotImplementedError(
+            f"Resume not implemented for {type(explorer).__name__}. "
+            f"Use --mode default or --mode erg."
+        )
+
+    explorer.round = max(explorer.iteration_data) + 1
+    if verbose:
+        print(
+            f"  resumed: {len(all_smiles):,} accepted across {len(iters)} prior rounds; "
+            f"continuing at round {explorer.round}"
+        )
+    return explorer.round
+
+
 def run_adaptive(
     generator_func: Callable,
     n_rounds: int = 5,
@@ -199,6 +337,12 @@ def run_adaptive(
     temperature_func: Callable = None,
     verbose: bool = True,
     save_log_path: str = None,
+    reference_canonical=None,
+    auto_erg_switch: bool = False,
+    auto_erg_drop: float = 0.01,
+    auto_erg_patience: int = 2,
+    after_round: Callable = None,
+    resume_log: str = None,
     **explorer_kwargs,
 ):
     """Run an adaptive multi-round sampling loop.
@@ -249,8 +393,73 @@ def run_adaptive(
         print(f"adaptive: mode={mode}, rounds={n_rounds}, "
               f"n_per_round={n_samples_per_round}, explorer={type(explorer).__name__}")
 
+    if resume_log:
+        _resume_explorer(explorer, resume_log, verbose=verbose)
+        # Replay the per-round after_round callback so dynamic state
+        # (e.g. _run_mlx's text_state seed corpus) catches up with the
+        # accepted SMILES of every loaded round, in chronological order.
+        if after_round is not None:
+            for r in sorted(explorer.iteration_data):
+                try:
+                    after_round(explorer, r)
+                except Exception as e:
+                    if verbose:
+                        print(f"  [resume after_round@{r} {type(e).__name__}: {e}]")
+
+    round_history = []
     for _ in range(n_rounds):
         explorer.run_round(n_samples=n_samples_per_round, verbose=verbose)
+        round_idx = explorer.round - 1
+        round_history.append(
+            _round_metrics(
+                explorer,
+                round_idx=round_idx,
+                n_samples=n_samples_per_round,
+                reference_canonical=reference_canonical,
+            )
+        )
+        if after_round is not None:
+            try:
+                after_round(explorer, round_idx)
+            except Exception as e:
+                if verbose:
+                    print(f"  [after_round callback raised {type(e).__name__}: {e}]")
+
+        if (
+            auto_erg_switch
+            and mode in ("default", "inchikey")
+            and should_switch_to_erg(
+                round_history,
+                drop_threshold=auto_erg_drop,
+                patience=auto_erg_patience,
+            )
+        ):
+            erg_kwargs = {
+                "cluster_threshold": explorer_kwargs.get("cluster_threshold", 0.75),
+                "max_per_cluster": explorer_kwargs.get(
+                    "max_per_cluster", explorer_kwargs.get("max_cluster", 20)
+                ),
+                "max_freq": explorer_kwargs.get("max_freq", 2),
+                "novelty_threshold": explorer_kwargs.get("novelty_threshold", 0.95),
+            }
+            next_explorer = ErgAdaptiveExplorer(
+                generator_func=generator_func,
+                temperature_func=temperature_func,
+                **erg_kwargs,
+            )
+            next_explorer.seed_dataset(explorer.get_dataset())
+            next_explorer.round = explorer.round
+            next_explorer.freq = Counter(explorer.freq)
+            next_explorer.iteration_data.update(explorer.iteration_data)
+            next_explorer.generated_data.update(explorer.generated_data)
+            explorer = next_explorer
+            mode = "erg"
+            if verbose:
+                print(
+                    f"  auto-switch → erg after round {round_idx} "
+                    f"(accepted and novelty dropped > {100 * auto_erg_drop:.1f}% "
+                    f"for {auto_erg_patience} rounds)"
+                )
 
     if save_log_path:
         explorer.save_log(save_log_path, save_all=True)
@@ -258,6 +467,22 @@ def run_adaptive(
             print(f"  log saved → {save_log_path}")
 
     return explorer
+
+
+def run_adaptive_iterations(
+    explorer,
+    n_rounds: int,
+    n_samples_per_round: int,
+    verbose: bool = True,
+):
+    """Run the explicit round loop used by the CLI.
+
+    This helper exists so library users can drive the exact same iterative
+    process as `python -m geneva2s.main --adaptive ...` without going through
+    argparse.
+    """
+    for _ in range(n_rounds):
+        explorer.run_round(n_samples=n_samples_per_round, verbose=verbose)
 
 
 # ============================================================================
@@ -283,8 +508,11 @@ def compute_morgan_batch(smiles_list, radius: int = 2, nbits: int = 2048):
             idx_map.append(i)
     if not valid_smis:
         return None, []
+    # use_rdkit_generator=True routes through MorganGenerator (no per-call
+    # DEPRECATION WARNING from the legacy GetMorganFingerprintAsBitVect path).
     fp_bytes = morgan_fp_bytes_from_smiles(
-        valid_smis, radius=radius, nbits=nbits, use_chirality=False
+        valid_smis, radius=radius, nbits=nbits, use_chirality=False,
+        use_rdkit_generator=True,
     )
     fp_u32 = fp_uint8_to_uint32(fp_bytes)
     return fp_u32, idx_map
@@ -306,7 +534,8 @@ class MorganAdaptiveExplorer:
     - Novelty filter = mlxmolkit's GPU Tanimoto kernel against the accepted
       bank. Sub-millisecond at 10k+ accepted on Apple Silicon.
 
-    Requires `mlxmolkit` (`pip install mlxmolkit-rdkit`).
+    Requires `mlxmolkit` from GitHub:
+    `uv pip install --force-reinstall --no-deps git+https://github.com/guillaume-osmo/mlxmolkit.git@main`.
     """
 
     def __init__(
@@ -370,6 +599,7 @@ class MorganAdaptiveExplorer:
 
     def run_round(self, n_samples: int = 1000, verbose: bool = False):
         start = time.time()
+        _reset_round_peak()
         mx = self._mx
         cluster_summary = {i: c for i, c in enumerate(self._centroid_counts)}
         temperature = self.temperature_func(self.round, self.freq, cluster_summary)
@@ -478,7 +708,8 @@ class MorganAdaptiveExplorer:
                 f"[Round {self.round}] T={temperature:.2f} | "
                 f"valid={len(cand_smiles)}/{len(generated)} | "
                 f"accepted={added} | clusters={n_clusters} | "
-                f"bank={bank_size} | time={time.time()-start:.2f}s"
+                f"bank={bank_size} | time={time.time()-start:.2f}s | "
+                f"{_mem_snapshot()}"
             )
         self.round += 1
 
@@ -545,7 +776,8 @@ class ErgAdaptiveExplorer:
     - Bank + centroids are `mx.array (N, 315) float32` — concatenated on
       accept and then queried via a single batched matmul per round.
 
-    Requires `mlxmolkit>=0.5.0` (`pip install mlxmolkit-rdkit`).
+    Requires `mlxmolkit>=0.5.0` from GitHub:
+    `uv pip install --force-reinstall --no-deps git+https://github.com/guillaume-osmo/mlxmolkit.git@main`.
     """
 
     def __init__(
@@ -556,6 +788,7 @@ class ErgAdaptiveExplorer:
         max_per_cluster: int = 20,
         max_freq: int = 2,
         novelty_threshold: float = 0.95,
+        max_centroids: int = 2_000,
     ):
         try:
             import mlx.core as mx  # noqa
@@ -584,6 +817,7 @@ class ErgAdaptiveExplorer:
         self.max_per_cluster = max_per_cluster
         self.max_freq = max_freq
         self.novelty_threshold = novelty_threshold
+        self.max_centroids = max_centroids
 
         self.round = 0
         self.dataset: set = set()
@@ -591,9 +825,8 @@ class ErgAdaptiveExplorer:
         self.iteration_data: dict = defaultdict(list)
         self.generated_data: dict = defaultdict(list)
 
-        # mx.array (N_accepted, 315) of ERG FPs (the "bank"); same for centroids.
-        # None until first accept.
-        self._bank: Optional["mx.array"] = None
+        # Novelty + cluster assignment both run against centroids only — bounded
+        # by the number of distinct clusters, not total accepted molecules.
         self._centroids: Optional["mx.array"] = None
         self._centroid_counts: list = []
 
@@ -611,8 +844,55 @@ class ErgAdaptiveExplorer:
             return new_rows
         return mx.concatenate([current, new_rows], axis=0)
 
+    def seed_dataset(self, smiles_list, seed_batch_size: int = 5_000):
+        """Seed accepted molecules when switching from default/inchikey to ERG.
+
+        All input SMILES are added to ``self.dataset`` so the ERG explorer never
+        re-accepts molecules from the previous phase.  ERG FPs are computed in
+        chunks of ``seed_batch_size`` to bound peak memory (avoids allocating
+        a huge RDKit-object graph for the entire list at once), then merged and
+        sampled down to ``max_centroids`` representatives.
+        """
+        import random as _random
+
+        smiles_list = list(smiles_list)
+        if not smiles_list:
+            return
+
+        mx = self._mx
+
+        # Always add ALL molecules to the dataset so they cannot be re-accepted.
+        self.dataset.update(smiles_list)
+
+        # Compute ERG FPs in chunks to keep peak memory bounded.
+        chunk_fps_list = []
+        for b0 in range(0, len(smiles_list), seed_batch_size):
+            batch = smiles_list[b0: b0 + seed_batch_size]
+            fps_chunk, _ = compute_erg_batch(batch)
+            if fps_chunk is not None:
+                chunk_fps_list.append(np.array(fps_chunk))
+            del fps_chunk
+
+        if not chunk_fps_list:
+            return
+
+        all_fps = np.concatenate(chunk_fps_list, axis=0)  # shape (N_valid, 315)
+        del chunk_fps_list
+        n = all_fps.shape[0]
+
+        if n <= self.max_centroids:
+            self._centroids = self._append_rows(self._centroids, mx.array(all_fps))
+            self._centroid_counts.extend([1] * n)
+        else:
+            # Random subsample to respect the cap
+            chosen = sorted(_random.sample(range(n), self.max_centroids))
+            self._centroids = mx.array(all_fps[chosen])
+            self._centroid_counts = [1] * self.max_centroids
+        del all_fps
+
     def run_round(self, n_samples: int = 1000, verbose: bool = False):
         start = time.time()
+        _reset_round_peak()
         mx = self._mx
         cluster_summary = {i: c for i, c in enumerate(self._centroid_counts)}
         temperature = self.temperature_func(self.round, self.freq, cluster_summary)
@@ -627,28 +907,42 @@ class ErgAdaptiveExplorer:
             return
         cand_smiles = [generated[i] for i in idx_map]
 
-        # Batched novelty: max cosine to all-accepted bank (sub-ms GPU)
-        if self._bank is not None:
-            max_sims = np.array(self._max_cosine_to_set(cand_fps, self._bank))
-        else:
-            max_sims = np.zeros(len(cand_smiles), dtype=np.float32)
-
-        # Batched cluster assignment: cand × centroids → argmax per row
+        # Chunked centroid similarity — avoids creating a full (n_cand × n_cent)
+        # matrix in one shot (which was ~1.8 GB per round with 50k centroids).
+        # Each chunk is centroid_chunk_size centroids → ~180 MB intermediate.
+        n_cand = len(cand_smiles)
         if self._centroids is not None:
-            sim_to_cent = np.array(self._cosine_matrix(cand_fps, self._centroids))
+            n_cent = int(self._centroids.shape[0])
+            best_sims = np.full(n_cand, -1.0, dtype=np.float32)
+            best_cids = np.full(n_cand, -1, dtype=np.int32)
+            _chunk = getattr(self, "centroid_chunk_size", 5_000)
+            for c0 in range(0, n_cent, _chunk):
+                chunk = self._centroids[c0: c0 + _chunk]
+                chunk_sim = np.array(self._cosine_matrix(cand_fps, chunk))
+                chunk_max = chunk_sim.max(axis=1)
+                chunk_arg = chunk_sim.argmax(axis=1)
+                better = chunk_max > best_sims
+                best_sims = np.where(better, chunk_max, best_sims)
+                best_cids = np.where(better, c0 + chunk_arg, best_cids)
+                del chunk_sim
+            max_sims = best_sims  # alias for novelty filter
         else:
-            sim_to_cent = np.zeros((len(cand_smiles), 0), dtype=np.float32)
+            n_cent = 0
+            best_sims = np.zeros(n_cand, dtype=np.float32)
+            best_cids = np.full(n_cand, -1, dtype=np.int32)
+            max_sims = best_sims
 
         added = 0
         accepted_idx = []
+        n_new_centroids_this_round = 0  # tracks how many _centroid_counts.append(1) happen
         for i, smi in enumerate(cand_smiles):
             self.freq[smi] += 1
             scaff = self._scaffold(smi)
 
-            # Cluster assignment uses centroids snapshotted at start of batch.
-            if sim_to_cent.shape[1] > 0:
-                best_cid = int(np.argmax(sim_to_cent[i]))
-                best_sim = float(sim_to_cent[i, best_cid])
+            # Cluster assignment from pre-computed chunked best_sims/best_cids.
+            if n_cent > 0:
+                best_cid = int(best_cids[i])
+                best_sim = float(best_sims[i])
             else:
                 best_cid, best_sim = -1, 0.0
             joins_existing = best_sim >= self.cluster_threshold
@@ -681,40 +975,50 @@ class ErgAdaptiveExplorer:
             if joins_existing:
                 self._centroid_counts[best_cid] += 1
             else:
-                self._centroid_counts.append(1)
+                # Respect max_centroids cap: only create a new centroid if room remains.
+                under_cap = (
+                    len(self._centroid_counts) + n_new_centroids_this_round
+                    < self.max_centroids
+                )
+                if under_cap:
+                    self._centroid_counts.append(1)
+                    n_new_centroids_this_round += 1
+                    cluster_id = len(self._centroid_counts) - 1
+                else:
+                    cluster_id = -1  # accepted into dataset but no new centroid slot
             accepted_idx.append(i)
             self.iteration_data[self.round].append({
                 "smiles": smi,
                 "round": self.round,
                 "freq": self.freq[smi],
-                "cluster": cluster_id if joins_existing else len(self._centroid_counts) - 1,
+                "cluster": cluster_id,
                 "scaffold": scaff,
                 "erg_max_cosine": float(max_sims[i]),
             })
             added += 1
 
-        # GPU-side concat: bank gets all accepted; centroids only get the
-        # new-cluster ones (those whose best_sim < cluster_threshold).
-        if accepted_idx:
-            accepted_rows = cand_fps[mx.array(accepted_idx)]
-            self._bank = self._append_rows(self._bank, accepted_rows)
-
+        # Only new-cluster accepts (best_sim < cluster_threshold) become centroids,
+        # and only up to n_new_centroids_this_round of them (those that got a slot).
+        if accepted_idx and n_new_centroids_this_round > 0:
             new_centroid_local_idx = []
             for local_pos, i in enumerate(accepted_idx):
-                if sim_to_cent.shape[1] == 0 or sim_to_cent[i].max() < self.cluster_threshold:
+                if len(new_centroid_local_idx) >= n_new_centroids_this_round:
+                    break
+                if n_cent == 0 or float(best_sims[i]) < self.cluster_threshold:
                     new_centroid_local_idx.append(local_pos)
             if new_centroid_local_idx:
+                accepted_rows = cand_fps[mx.array(accepted_idx)]
                 new_centroid_rows = accepted_rows[mx.array(new_centroid_local_idx)]
                 self._centroids = self._append_rows(self._centroids, new_centroid_rows)
 
         if verbose:
             n_clusters = len(self._centroid_counts)
-            bank_size = 0 if self._bank is None else int(self._bank.shape[0])
             print(
                 f"[Round {self.round}] T={temperature:.2f} | "
                 f"valid={len(cand_smiles)}/{len(generated)} | "
                 f"accepted={added} | clusters={n_clusters} | "
-                f"bank={bank_size} | time={time.time()-start:.2f}s"
+                f"accepted_total={len(self.dataset)} | time={time.time()-start:.2f}s | "
+                f"{_mem_snapshot()}"
             )
         self.round += 1
 

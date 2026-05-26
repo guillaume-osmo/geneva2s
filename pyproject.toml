@@ -16,6 +16,7 @@ dependencies = [
     "numpy",
     "rdkit",
     "h5py",
+    "psutil",
 ]
 
 [project.optional-dependencies]
@@ -27,8 +28,8 @@ mlx = ["mlx>=0.20"]
 # https://github.com/guillaume-osmo/mlx-addons (or local checkout).
 mlx-metal = ["mlx>=0.20", "mlx-addons"]
 # discovery / erg adaptive modes need mlxmolkit (Metal Tanimoto + GPU cosine).
-# mlxmolkit-rdkit is not on PyPI yet — install from
-# https://github.com/guillaume-osmo/mlxmolkit (or local checkout).
+# mlxmolkit-rdkit is not on PyPI yet — install from GitHub with
+# `uv pip install --force-reinstall --no-deps git+https://github.com/guillaume-osmo/mlxmolkit.git@main`
 discovery = ["mlx>=0.20", "mlxmolkit-rdkit>=0.5.0"]
 tests = ["pytest>=7.0"]
 all = [
