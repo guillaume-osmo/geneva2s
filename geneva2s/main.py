@@ -276,6 +276,12 @@ def _run_tf(args, raw, train_canonical):
 # ----------------------------------------------------------------------------
 
 def _run_mlx(args, raw, train_canonical):
+    if args.arch == "bilstm":
+        return _run_mlx_bilstm(args, raw, train_canonical)
+    return _run_mlx_gpt(args, raw, train_canonical)
+
+
+def _run_mlx_bilstm(args, raw, train_canonical):
     from .mlx.generate import predict_batch_seeds
     from .mlx.model import (
         GenevaBiLSTMMLX, GenevaBiLSTMMLXFused,
@@ -338,6 +344,72 @@ def _run_mlx(args, raw, train_canonical):
 
     return _generation_phase(args, gen_fn, train_canonical, "MLX",
                               after_round=_extend_corpus)
+
+
+def _run_mlx_gpt(args, raw, train_canonical):
+    """GPT-MLX backend: BPE tokenizer + decoder-only transformer."""
+    from .mlx.gpt import GPT_VARIANTS
+    from .mlx.gpt_train import (
+        tokens_from_corpus, prepare_xy, fit_gpt, load_state as gpt_load_state,
+        predict_gpt_batch,
+    )
+    from .smiles_tokenizer import SmilesBPE
+
+    print(f"backend: MLX — {args.arch} (GPT)")
+
+    tok_path = args.tokenizer or "data/smiles_bpe_v1.json"
+    if not Path(tok_path).exists():
+        raise FileNotFoundError(
+            f"Tokenizer {tok_path!r} not found. Train one with:\n"
+            f"  python -m geneva2s.smiles_tokenizer train --corpus {args.smi} "
+            f"--vocab-size 1024 --out {tok_path}"
+        )
+    bpe = SmilesBPE.load(tok_path)
+    print(f"tokenizer: {tok_path} (vocab={bpe.vocab_size})")
+
+    cls = GPT_VARIANTS[args.arch]
+    model = cls(vocab_size=bpe.vocab_size)
+    print(f"model: {cls.__name__}, context={model.cfg['context_length']}, "
+          f"emb={model.cfg['emb_dim']}, layers={model.cfg['n_layers']}, "
+          f"heads={model.cfg['n_heads']}")
+
+    if not args.skip_train:
+        tokens = tokens_from_corpus(bpe, raw, max_len=model.cfg["context_length"])
+        X, y, pad_mask = prepare_xy(tokens, pad_id=bpe.pad_id)
+        print(f"training {args.epochs} epochs on X={X.shape} (BPE-tokenised) ...")
+        t0 = time.time()
+        fit_gpt(model, X, y, pad_mask,
+                num_epochs=args.epochs, batch_size=args.batch_size,
+                lr=args.lr, save_path=args.model_path)
+        print(f"  trained in {time.time()-t0:.1f}s -> {args.model_path}")
+    else:
+        if not Path(args.model_path).exists():
+            raise FileNotFoundError(f"--skip-train but no checkpoint at {args.model_path}")
+        gpt_load_state(model, args.model_path)
+        print(f"loaded {args.model_path}")
+
+    # Dynamic seed pool — start with the training corpus, append accepted
+    # molecules each round so the generator's prompts drift toward the
+    # chemistry the adaptive loop is discovering.
+    seed_pool = {"pool": list({s for s in raw if s and s.strip()})}
+
+    def gen_fn(n, _temp):
+        return predict_gpt_batch(
+            model, bpe, ncollect=n,
+            batch_size=max(1, args.ncopies),
+            max_new_tokens=model.cfg["context_length"] - 2,
+            seed_smiles=seed_pool["pool"],
+        )
+
+    def _extend_seed_pool(explorer, round_idx):
+        new = [row["smiles"] for row in explorer.iteration_data.get(round_idx, [])]
+        if not new:
+            return
+        seed_pool["pool"] = list(set(seed_pool["pool"]) | set(new))
+
+    return _generation_phase(args, gen_fn, train_canonical,
+                              f"MLX-{args.arch}",
+                              after_round=_extend_seed_pool)
 
 
 # ----------------------------------------------------------------------------
@@ -437,6 +509,16 @@ def main():
                    help="MLX only: Metal + grouped 4-branch (fastest)")
     p.add_argument("--fused", action="store_true",
                    help="MLX only: Python-fused grouped LSTM")
+    p.add_argument("--arch", default="bilstm",
+                   choices=["bilstm", "gpt", "gpt-mla", "gpt-dsa", "gpt-mla-dsa"],
+                   help="MLX architecture: bilstm (default, legacy) or one of the "
+                        "GPT-style decoders (SwiGLU + SDPA + RoPE; needs --tokenizer "
+                        "for BPE encoding). gpt-mla = Multi-Head Latent Attention; "
+                        "gpt-dsa = DeepSeek Sparse Attention; gpt-mla-dsa = both.")
+    p.add_argument("--tokenizer", default=None,
+                   help="Path to a SMILES BPE tokenizer JSON (default for --arch gpt*: "
+                        "data/smiles_bpe_v1.json). Train one with "
+                        "`python -m geneva2s.smiles_tokenizer train ...`.")
     args = p.parse_args()
 
     # Resolve --backend from legacy flags

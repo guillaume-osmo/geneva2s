@@ -16,3 +16,6 @@ env/
 *.log
 logs/
 /tmp_models/
+
+# Runtime FP caches written by geneva2s.viz alongside the source file
+*_fps.npz
