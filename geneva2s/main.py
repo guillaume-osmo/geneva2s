@@ -172,6 +172,7 @@ def _generation_phase(args, generator_func, train_canonical, label: str,
             save_log_path=str(log_path) if log_path else None,
             after_round=after_round,
             resume_log=resolved_resume,
+            save_log_all=args.save_all,
             **explorer_kwargs,
         )
         gen_time = time.time() - t0
@@ -415,6 +416,11 @@ def main():
                    help="Base filename for the run log (no .json). Default: "
                         "adaptive_<backend>_<YYYYMMDD_HHMMSS> — timestamped so "
                         "parallel/successive runs don't overwrite each other.")
+    p.add_argument("--save-all", action="store_true",
+                   help="Also save the full audit trail of every generated "
+                        "molecule (accepted + rejected) in the `generated` key. "
+                        "Default off: ~50%% smaller logs, audit kept only for "
+                        "accepted via `iterations`.")
     p.add_argument("--resume-from-log", default=None,
                    help="Path to a prior adaptive log JSON to resume from. "
                         "Loads iteration_data/freq/cluster_counts/dataset, "
