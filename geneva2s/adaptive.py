@@ -343,6 +343,7 @@ def run_adaptive(
     auto_erg_patience: int = 2,
     after_round: Callable = None,
     resume_log: str = None,
+    save_log_all: bool = False,
     **explorer_kwargs,
 ):
     """Run an adaptive multi-round sampling loop.
@@ -462,9 +463,14 @@ def run_adaptive(
                 )
 
     if save_log_path:
-        explorer.save_log(save_log_path, save_all=True)
+        # Accepts-only by default: `generated` (all generated, including rejected)
+        # is the biggest contributor to log size (~50%+) and is rarely consumed
+        # downstream. Callers that want the full audit trail can override via
+        # `save_log_all=True` (CLI: --save-all).
+        explorer.save_log(save_log_path, save_all=save_log_all)
         if verbose:
-            print(f"  log saved → {save_log_path}")
+            mode_note = "all generated + accepted" if save_log_all else "accepted only"
+            print(f"  log saved → {save_log_path} ({mode_note})")
 
     return explorer
 
