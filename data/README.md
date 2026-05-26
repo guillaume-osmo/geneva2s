@@ -41,6 +41,9 @@ run on top of the Keras base model. Format: a JSON list of `[chosen, rejected]`
 SMILES pairs. Both members of each pair have approximately equal SMILES length
 (filename suffix `equallength2`) — important for DPO loss numerics.
 
+This is historical data only. The live geneva2s setup does not require DPO, and
+the DPO training/extractor path is not part of the current maintained workflow.
+
 Example pair:
 
 ```json
@@ -50,9 +53,9 @@ Example pair:
 ]
 ```
 
-This is a snapshot — not auto-regenerated. To rebuild from scratch you need the
-adaptive-log → dpo-pair extractor that lived in the original `dpo_geneva.py`
-script (not ported to geneva2s yet).
+This is a snapshot — not auto-regenerated. Rebuilding it would require the
+adaptive-log → dpo-pair extractor from the original `dpo_geneva.py` script,
+which is not ported into the active geneva2s flow.
 
 ## Provenance and history
 
@@ -66,4 +69,5 @@ the external drive at `Smiles-GEN-master/`:
 
 The Keras checkpoint `models/geneva2s.keras` is byte-identical to
 `Chembl_bilstm_4x_2.keras` (May 8, 2025). The DPO-finetuned variant
-`Chembl_bilstm_4x_2_dpo.{h5,keras}` (June 3-6, 2025) is not (yet) bundled here.
+`Chembl_bilstm_4x_2_dpo.{h5,keras}` (June 3-6, 2025) is not bundled here and is
+not required for the current live setup.

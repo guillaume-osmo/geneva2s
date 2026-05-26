@@ -85,7 +85,8 @@ def _print_score(s, label=""):
     print(f"  novel:       {s['novel']}  ({100*s['novel']/max(1,s['total']):.2f}% of generated)")
 
 
-def _generation_phase(args, generator_func, train_canonical, label: str):
+def _generation_phase(args, generator_func, train_canonical, label: str,
+                      after_round=None):
     """Run either one-shot or adaptive generation given a backend's gen function."""
     if args.adaptive:
         from .adaptive import run_adaptive
@@ -118,7 +119,12 @@ def _generation_phase(args, generator_func, train_canonical, label: str):
             n_rounds=args.rounds,
             n_samples_per_round=args.n_generate,
             mode=mode,
+            reference_canonical=train_canonical,
+            auto_erg_switch=args.auto_erg_switch,
+            auto_erg_drop=args.auto_erg_drop,
+            auto_erg_patience=args.auto_erg_patience,
             save_log_path=str(log_path) if log_path else None,
+            after_round=after_round,
             **explorer_kwargs,
         )
         gen_time = time.time() - t0
@@ -259,10 +265,29 @@ def _run_mlx(args, raw, train_canonical):
         load_state(model, args.model_path)
         print(f"loaded {args.model_path}")
 
-    def gen_fn(n, _temp):
-        return predict_batch_seeds(model, tok, text, ncollect=n, ncopies=args.ncopies)
+    # Dynamic seed corpus — `text` grows each round with newly accepted SMILES
+    # (mirrors the 2025 EVA `update_training_text_with_generated` + `Utils.Encode`
+    # loop, which is what actually drives the seed-window distribution since
+    # `_PredictBatchSeeds` samples from the encoded text — `seed_smiles_pool`
+    # in 2025 was dead code on the sampling path).
+    text_state = {"text": text}
 
-    return _generation_phase(args, gen_fn, train_canonical, "MLX")
+    def gen_fn(n, _temp):
+        return predict_batch_seeds(
+            model, tok, text_state["text"],
+            ncollect=n, ncopies=args.ncopies,
+        )
+
+    def _extend_corpus(explorer, round_idx):
+        new = [row["smiles"] for row in explorer.iteration_data.get(round_idx, [])]
+        if not new:
+            return
+        addition = tok.prepare_corpus(new)
+        if addition:
+            text_state["text"] = text_state["text"] + addition
+
+    return _generation_phase(args, gen_fn, train_canonical, "MLX",
+                              after_round=_extend_corpus)
 
 
 # ----------------------------------------------------------------------------
@@ -322,11 +347,21 @@ def main():
     p.add_argument("--cluster-threshold", type=float, default=None,
                    help="Cluster-membership threshold (discovery/erg). "
                         "Default 0.6 for Tanimoto (discovery), 0.75 for cosine (erg).")
-    p.add_argument("--max-per-cluster", type=int, default=20,
-                   help="Cap on accepted molecules per cluster")
+    p.add_argument("--max-per-cluster", type=int, default=20_000,
+                   help="Cap on accepted molecules per cluster "
+                        "(2025 EVA used 20000; the prior default of 20 caused "
+                        "early saturation in default/InChIKey mode)")
     p.add_argument("--novelty-threshold", type=float, default=None,
                    help="Max-similarity reject threshold against accepted bank "
                         "(discovery/erg). Default 0.85 (Tanimoto) / 0.95 (cosine).")
+    p.add_argument("--auto-erg-switch", action="store_true",
+                   help="Default/inchikey only: switch to ERG if accepted and novelty "
+                        "both drop for 2 consecutive rounds")
+    p.add_argument("--auto-erg-drop", type=float, default=0.01,
+                   help="Minimum round-over-round drop required to trigger auto ERG "
+                        "(default: 0.01 = 1 percentage point)")
+    p.add_argument("--auto-erg-patience", type=int, default=2,
+                   help="Number of consecutive down rounds required before switching")
     p.add_argument("--log-dir", default=None,
                    help="Directory to save adaptive logs (JSON)")
 
@@ -357,14 +392,32 @@ def main():
         try:
             import mlxmolkit  # noqa
         except ImportError:
-            p.error(f"--mode {args.mode} requires mlxmolkit: pip install mlxmolkit-rdkit")
+            p.error(
+                f"--mode {args.mode} requires mlxmolkit from GitHub: "
+                "uv pip install --force-reinstall --no-deps "
+                "git+https://github.com/guillaume-osmo/mlxmolkit.git@main"
+            )
         if args.mode == "erg":
             try:
                 from mlxmolkit.erg_features import erg_fp_from_smiles  # noqa
                 from mlxmolkit.cosine_dense import cosine_matrix_dense  # noqa
             except ImportError:
-                p.error("--mode erg requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
-                        "Upgrade with: pip install -U mlxmolkit-rdkit")
+                p.error(
+                    "--mode erg requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
+                    "Upgrade from GitHub with: uv pip install --force-reinstall --no-deps "
+                    "git+https://github.com/guillaume-osmo/mlxmolkit.git@main"
+                )
+    if args.auto_erg_switch:
+        try:
+            import mlxmolkit  # noqa
+            from mlxmolkit.erg_features import erg_fp_from_smiles  # noqa
+            from mlxmolkit.cosine_dense import cosine_matrix_dense  # noqa
+        except ImportError:
+            p.error(
+                "--auto-erg-switch requires mlxmolkit>=0.5.0 (erg_features + cosine_dense). "
+                "Install from GitHub with: uv pip install --force-reinstall --no-deps "
+                "git+https://github.com/guillaume-osmo/mlxmolkit.git@main"
+            )
 
     # Threshold defaults: Tanimoto for morgan/discovery, cosine for erg.
     if args.cluster_threshold is None:
