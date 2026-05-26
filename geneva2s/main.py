@@ -89,8 +89,8 @@ def _resolve_resume_path(arg_value: str, log_dir: str, label: str) -> str:
     """Resolve --resume-from-log to a concrete file path.
 
     - exact file path → returned as-is
-    - "latest" or a directory → newest `adaptive_<label>_*.json` in that
-      directory (or `--log-dir`, or `./logs`)
+    - "latest" or a directory → newest `adaptive_<label>_*.{json,parquet}` in
+      that directory (or `--log-dir`, or `./logs`)
     """
     if not arg_value:
         return None
@@ -104,20 +104,22 @@ def _resolve_resume_path(arg_value: str, log_dir: str, label: str) -> str:
                 f"--resume-from-log {arg_value!r}: no such directory {search_dir}"
             )
         prefix = f"adaptive_{label.lower()}"
-        candidates = sorted(
-            (c for c in search_dir.glob(f"{prefix}*.json")),
-            key=lambda x: x.stat().st_mtime, reverse=True,
-        )
+        # Search both JSON and Parquet; prefer most-recent regardless of format.
+        def _scan(patterns):
+            files = []
+            for pat in patterns:
+                files.extend(search_dir.glob(pat))
+            return sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
+        candidates = _scan([f"{prefix}*.json", f"{prefix}*.parquet"])
         if not candidates:
-            # Be lenient — also accept any adaptive_*.json if backend-specific
-            # ones aren't found (helps when resuming across backend renames).
-            candidates = sorted(
-                search_dir.glob("adaptive_*.json"),
-                key=lambda x: x.stat().st_mtime, reverse=True,
-            )
+            # Be lenient — also accept any adaptive_*.{json,parquet} if
+            # backend-specific names aren't found (helps when resuming across
+            # backend renames).
+            candidates = _scan(["adaptive_*.json", "adaptive_*.parquet"])
         if not candidates:
             raise FileNotFoundError(
-                f"--resume-from-log {arg_value!r}: no adaptive_*.json found in {search_dir}"
+                f"--resume-from-log {arg_value!r}: no adaptive_*.{{json,parquet}} "
+                f"found in {search_dir}"
             )
         return str(candidates[0])
     raise FileNotFoundError(f"--resume-from-log {arg_value!r}: not a file or directory")
