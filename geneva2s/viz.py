@@ -118,6 +118,107 @@ def compute_fps(smiles: List[str], kind: str) -> Tuple[np.ndarray, np.ndarray]:
         raise ValueError(f"Unknown fp kind: {kind!r}. Use 'morgan' or 'erg'.")
 
 
+def _fps_cache_path(log_path: str, fp_kind: str) -> Path:
+    p = Path(log_path)
+    return p.with_name(f"{p.stem}_{fp_kind}_fps.npz")
+
+
+def _save_fps_cache(path: Path, fps: np.ndarray, smiles: List[str], fp_kind: str) -> None:
+    """Write FPs + the SMILES list that produced them.
+
+    Morgan FPs (2048 binary) are stored as scipy.sparse.csr_matrix components
+    via plain np.savez_compressed — typically 5-10× smaller than the dense form.
+    ERG FPs (315 dense float32) are stored dense + zstd-style compression.
+    """
+    smiles_arr = np.array(smiles, dtype=object)
+    if fp_kind == "morgan":
+        from scipy.sparse import csr_matrix
+        sparse = csr_matrix(fps.astype(np.uint8))
+        np.savez_compressed(
+            path,
+            kind=np.array("morgan"),
+            smiles=smiles_arr,
+            morgan_data=sparse.data,
+            morgan_indices=sparse.indices,
+            morgan_indptr=sparse.indptr,
+            morgan_shape=np.asarray(sparse.shape, dtype=np.int64),
+        )
+    elif fp_kind == "erg":
+        np.savez_compressed(
+            path,
+            kind=np.array("erg"),
+            smiles=smiles_arr,
+            erg=fps.astype(np.float32),
+        )
+    else:
+        raise ValueError(f"Unknown fp kind: {fp_kind!r}")
+
+
+def _load_fps_cache(path: Path, fp_kind: str) -> Tuple[np.ndarray, List[str]]:
+    """Load (fps, smiles) from cache. Raises if cache kind mismatches `fp_kind`."""
+    data = np.load(path, allow_pickle=True)
+    cached_kind = str(data["kind"])
+    if cached_kind != fp_kind:
+        raise ValueError(f"Cache {path} is for {cached_kind!r}, not {fp_kind!r}")
+    smiles = data["smiles"].tolist()
+    if fp_kind == "morgan":
+        from scipy.sparse import csr_matrix
+        sparse = csr_matrix(
+            (data["morgan_data"], data["morgan_indices"], data["morgan_indptr"]),
+            shape=tuple(data["morgan_shape"]),
+        )
+        fps = sparse.toarray().astype(np.float32)
+    elif fp_kind == "erg":
+        fps = np.asarray(data["erg"], dtype=np.float32)
+    else:
+        raise ValueError(f"Unknown fp kind: {fp_kind!r}")
+    return fps, smiles
+
+
+def compute_or_load_fps(
+    smiles: List[str],
+    fp_kind: str,
+    cache_path: Path = None,
+    verbose: bool = True,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """Compute FPs OR load from a sibling .npz cache when valid.
+
+    Cache is considered valid when:
+    - the file exists
+    - it was written for the same fp_kind
+    - it covers exactly the SMILES requested (length match; for full
+      content match, the cache stores the SMILES list and we compare)
+
+    Returns (fps, kept_idx_into_input, kept_smiles).
+    """
+    if cache_path and cache_path.is_file():
+        try:
+            cached_fps, cached_smiles = _load_fps_cache(cache_path, fp_kind)
+            if cached_smiles == smiles:
+                if verbose:
+                    print(f"  fp cache HIT: loaded {cached_fps.shape[0]:,} "
+                          f"{fp_kind} FPs from {cache_path.name}")
+                return cached_fps, np.arange(len(smiles), dtype=np.int64), cached_smiles
+            if verbose:
+                print(f"  fp cache stale (SMILES list differs); recomputing")
+        except Exception as e:
+            if verbose:
+                print(f"  fp cache unreadable ({type(e).__name__}: {e}); recomputing")
+
+    fps, kept = compute_fps(smiles, fp_kind)
+    kept_smiles = [smiles[i] for i in kept]
+    if cache_path is not None and fps.shape[0] > 0:
+        try:
+            _save_fps_cache(cache_path, fps, kept_smiles, fp_kind)
+            if verbose:
+                print(f"  fp cache SAVED: {cache_path.name} "
+                      f"({cache_path.stat().st_size/1e6:.1f} MB)")
+        except Exception as e:
+            if verbose:
+                print(f"  fp cache save failed ({type(e).__name__}: {e}); continuing")
+    return fps, kept, kept_smiles
+
+
 # ============================================================================
 # Reference 2D embedding (fit once on training corpus)
 # ============================================================================
@@ -378,6 +479,10 @@ def main(argv=None):
     p.add_argument("--subsample-per-round", type=int, default=0,
                    help="Random cap on generated SMILES per round "
                         "(default: 0 = use all; raise to skip if any round is huge)")
+    p.add_argument("--no-fp-cache", action="store_true",
+                   help="Disable the per-log FP cache (default: cache to "
+                        "<log_stem>_<ref|gen>_<fp>_fps.npz next to the log so "
+                        "subsequent --method runs reuse the FPs instantly)")
     p.add_argument("--out-png", default=None,
                    help="Output static scatter PNG (default: <log_stem>_<fp>_<method>_ref.png)")
     p.add_argument("--out-movie", default=None,
@@ -405,7 +510,10 @@ def main(argv=None):
     print(f"  {len(ref_smis):,} unique canonical SMILES")
     print(f"computing reference {args.fp} fingerprints ...")
     t0 = time.time()
-    ref_fps, ref_kept = compute_fps(ref_smis, args.fp)
+    ref_cache = None if args.no_fp_cache else _fps_cache_path(
+        str(ref_path), f"ref_{args.fp}"
+    )
+    ref_fps, ref_kept, _ = compute_or_load_fps(ref_smis, args.fp, ref_cache, verbose=True)
     print(f"  {ref_fps.shape[0]:,} valid FPs of dim {ref_fps.shape[1]} in {time.time()-t0:.1f}s")
     if ref_fps.shape[0] == 0:
         print("ERROR: no valid training FPs; aborting", file=sys.stderr)
@@ -429,7 +537,10 @@ def main(argv=None):
     # --- 3. Per-round projection into the fixed reference ---
     print(f"computing generated {args.fp} fingerprints ...")
     t0 = time.time()
-    gen_fps, gen_kept = compute_fps(smis, args.fp)
+    gen_cache = None if args.no_fp_cache else _fps_cache_path(
+        str(log_path), f"gen_{args.fp}"
+    )
+    gen_fps, gen_kept, _ = compute_or_load_fps(smis, args.fp, gen_cache, verbose=True)
     print(f"  {gen_fps.shape[0]:,} valid FPs in {time.time()-t0:.1f}s")
     if gen_fps.shape[0] == 0:
         print("ERROR: no valid generated FPs; aborting", file=sys.stderr)
