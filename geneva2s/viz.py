@@ -123,9 +123,12 @@ def reduce_2d(fps: np.ndarray, method: str, verbose: bool = True) -> np.ndarray:
     if method == "umap":
         reducer = mv.UMAP(n_components=2, n_neighbors=15, min_dist=0.1, verbose=verbose)
     elif method == "tsne":
-        reducer = mv.TSNE(n_components=2, verbose=verbose) if "verbose" in mv.TSNE.__init__.__doc__ else mv.TSNE(n_components=2)
+        # pca_dim=50 is the conventional t-SNE preprocessing AND works around
+        # an upstream bug in mlx-vis 0.7.0 where `X_mx` is only initialised
+        # inside the PCA branch (UnboundLocalError without pca_dim).
+        reducer = mv.TSNE(n_components=2, verbose=verbose, pca_dim=50)
     elif method == "pacmap":
-        reducer = mv.PaCMAP(n_components=2, verbose=verbose) if "verbose" in mv.PaCMAP.__init__.__doc__ else mv.PaCMAP(n_components=2)
+        reducer = mv.PaCMAP(n_components=2, verbose=verbose)
     else:
         raise ValueError(f"Unknown method {method!r}. Use 'umap', 'tsne', or 'pacmap'.")
 
