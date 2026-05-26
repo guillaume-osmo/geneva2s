@@ -90,19 +90,16 @@ def compute_fps(smiles: List[str], kind: str) -> Tuple[np.ndarray, np.ndarray]:
             return np.zeros((0, 315), dtype=np.float32), np.zeros(0, dtype=np.int64)
         return np.array(fp).astype(np.float32), np.asarray(idx_map, dtype=np.int64)
     elif kind == "morgan":
-        from rdkit.Chem import AllChem, MolFromSmiles
-        # Use rdkit directly to keep the bits → numpy float pipeline simple.
-        # mlxmolkit packs to uint32 for fused Tanimoto; for UMAP we want unpacked.
+        from rdkit.Chem import MolFromSmiles, rdFingerprintGenerator
+        # Modern MorganGenerator path (the legacy GetMorganFingerprintAsBitVect
+        # emits a per-call DEPRECATION WARNING in 2025+ rdkit).
+        gen = rdFingerprintGenerator.GetMorganGenerator(radius=2, fpSize=2048)
         rows, kept = [], []
         for i, smi in enumerate(smiles):
             mol = MolFromSmiles(smi)
             if mol is None:
                 continue
-            bv = AllChem.GetMorganFingerprintAsBitVect(mol, 2, 2048)
-            arr = np.zeros((2048,), dtype=np.int8)
-            from rdkit import DataStructs
-            DataStructs.ConvertToNumpyArray(bv, arr)
-            rows.append(arr.astype(np.float32))
+            rows.append(gen.GetFingerprintAsNumPy(mol).astype(np.float32))
             kept.append(i)
         if not rows:
             return np.zeros((0, 2048), dtype=np.float32), np.zeros(0, dtype=np.int64)

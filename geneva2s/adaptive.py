@@ -424,8 +424,11 @@ def compute_morgan_batch(smiles_list, radius: int = 2, nbits: int = 2048):
             idx_map.append(i)
     if not valid_smis:
         return None, []
+    # use_rdkit_generator=True routes through MorganGenerator (no per-call
+    # DEPRECATION WARNING from the legacy GetMorganFingerprintAsBitVect path).
     fp_bytes = morgan_fp_bytes_from_smiles(
-        valid_smis, radius=radius, nbits=nbits, use_chirality=False
+        valid_smis, radius=radius, nbits=nbits, use_chirality=False,
+        use_rdkit_generator=True,
     )
     fp_u32 = fp_uint8_to_uint32(fp_bytes)
     return fp_u32, idx_map
