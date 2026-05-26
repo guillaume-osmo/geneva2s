@@ -42,9 +42,13 @@ import numpy as np
 # ============================================================================
 
 def load_log(path: str) -> Dict[int, List[str]]:
-    """Return {round_idx: [smiles, ...]} from an adaptive-generation log."""
-    with open(path) as f:
-        data = json.load(f)
+    """Return {round_idx: [smiles, ...]} from an adaptive-generation log.
+
+    Auto-detects format via extension: `.parquet` → parquet + meta sidecar
+    via `adaptive.load_log_full`; otherwise JSON.
+    """
+    from .adaptive import load_log_full
+    data = load_log_full(path)
     src = data.get("iterations") or data.get("generated") or {}
     out: Dict[int, List[str]] = {}
     for k, rows in src.items():

@@ -33,7 +33,151 @@ import numpy as np
 from rdkit.Chem import AllChem, DataStructs, MolFromSmiles
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
+from pathlib import Path as _Path
+
 from .utils import canonicalize, get_inchikey_prefix, is_valid_molecule
+
+
+# ============================================================================
+# Log serialisation: JSON (default) or Parquet (single-file binary, ~5-10×
+# smaller and lazy-read by column). Routing is by file extension.
+# ============================================================================
+
+def _write_log_payload(payload: dict, path: str) -> None:
+    """Write `payload` as JSON or Parquet+meta-sidecar based on `path` suffix.
+
+    Parquet path emits two files:
+    - `<stem>.parquet`        the iterations (and, if save_all, generated)
+                              rows as a flat columnar table.
+    - `<stem>.meta.json`      a tiny sidecar with frequency + cluster_counts
+                              (these are aggregates, not per-mol; storing them
+                              in parquet metadata risks exceeding reader limits
+                              for large freq Counters).
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if _Path(path).suffix.lower() == ".parquet":
+        _write_log_parquet(payload, path)
+    else:
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+
+def _write_log_parquet(payload: dict, path: str) -> None:
+    """Write iterations (+ optionally generated) as a single parquet table.
+
+    Schema is built column-wise to coerce types consistently across rows
+    (notably `cluster`, which is a string InChIKey-3 prefix in default
+    mode but an integer cluster index in ERG/Morgan mode — coerced to
+    string for the parquet column so the same file can hold both).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    cols: dict = {
+        "_kind": [], "round": [], "smiles": [], "freq": [],
+        "cluster": [], "scaffold": [], "accepted": [],
+        "tanimoto_max": [], "erg_max_cosine": [],
+    }
+
+    def _push(row: dict, kind: str, r_int: int) -> None:
+        cols["_kind"].append(kind)
+        cols["round"].append(int(r_int))
+        cols["smiles"].append(row.get("smiles"))
+        f = row.get("freq")
+        cols["freq"].append(int(f) if f is not None else None)
+        c = row.get("cluster")
+        cols["cluster"].append(str(c) if c is not None else None)
+        cols["scaffold"].append(row.get("scaffold"))
+        cols["accepted"].append(row.get("accepted"))
+        cols["tanimoto_max"].append(
+            float(row["tanimoto_max"]) if row.get("tanimoto_max") is not None else None
+        )
+        cols["erg_max_cosine"].append(
+            float(row["erg_max_cosine"]) if row.get("erg_max_cosine") is not None else None
+        )
+
+    for r, entries in (payload.get("iterations") or {}).items():
+        r_int = int(r) if not isinstance(r, int) else r
+        for entry in entries:
+            _push(entry, "accepted", r_int)
+    if payload.get("generated"):
+        for r, entries in payload["generated"].items():
+            r_int = int(r) if not isinstance(r, int) else r
+            for entry in entries:
+                _push(entry, "generated", r_int)
+    if not cols["_kind"]:
+        _push({"smiles": None, "freq": 0, "cluster": None, "scaffold": None,
+               "accepted": None}, "empty", -1)
+
+    table = pa.table(cols)
+    pq.write_table(table, path, compression="zstd")
+
+    # Sidecar metadata gzipped — frequency Counter can be hundreds of MBs of
+    # raw JSON for a long run; gzip on the repetitive {smiles:int} pairs
+    # typically gives 5-8× compression.
+    import gzip
+    meta_path = str(_Path(path).with_suffix(".meta.json.gz"))
+    meta = {
+        "frequency": payload.get("frequency", {}),
+        "cluster_counts": payload.get("cluster_counts", {}),
+    }
+    with gzip.open(meta_path, "wt", encoding="utf-8", compresslevel=6) as f:
+        json.dump(meta, f, separators=(",", ":"))
+
+
+def load_log_full(path: str) -> dict:
+    """Load a saved adaptive log (JSON or Parquet+meta sidecar). Returns the
+    canonical `{iterations, frequency, cluster_counts, generated?}` shape.
+
+    Round keys come back as Python int. None-valued cells from a parquet
+    file (e.g. `tanimoto_max` for a default-mode entry) are stripped.
+    """
+    p = _Path(path)
+    if p.suffix.lower() == ".parquet":
+        import pyarrow.parquet as pq
+        table = pq.read_table(path)
+        rows = table.to_pylist()
+        iterations: dict = defaultdict(list)
+        generated: dict = defaultdict(list)
+        for row in rows:
+            kind = row.pop("_kind", "accepted")
+            if kind == "empty":
+                continue
+            r_int = row.pop("round")
+            clean = {k: v for k, v in row.items() if v is not None}
+            if r_int is not None:
+                clean.setdefault("round", r_int)
+            if kind == "accepted":
+                iterations[r_int].append(clean)
+            elif kind == "generated":
+                generated[r_int].append(clean)
+
+        # Sidecar lookup: prefer .meta.json.gz (current format), fall back to
+        # .meta.json (uncompressed, written by earlier code).
+        meta = {}
+        for ext in (".meta.json.gz", ".meta.json"):
+            mp = p.with_suffix(ext)
+            if mp.is_file():
+                if ext.endswith(".gz"):
+                    import gzip
+                    with gzip.open(mp, "rt", encoding="utf-8") as f:
+                        meta = json.load(f)
+                else:
+                    with open(mp) as f:
+                        meta = json.load(f)
+                break
+
+        out = {
+            "iterations": dict(iterations),
+            "frequency": meta.get("frequency", {}),
+            "cluster_counts": meta.get("cluster_counts", {}),
+        }
+        if generated:
+            out["generated"] = dict(generated)
+        return out
+
+    with open(path) as f:
+        return json.load(f)
 
 
 # ============================================================================
@@ -247,9 +391,7 @@ class AdaptiveSmilesExplorer:
         }
         if save_all:
             to_save["generated"] = dict(self.generated_data)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(to_save, f, indent=2)
+        _write_log_payload(to_save, path)
 
     def get_dataset(self) -> list:
         return list(self.dataset)
@@ -281,8 +423,7 @@ def _resume_explorer(explorer, log_path: str, verbose: bool = True) -> int:
     so callers can replay any `after_round` callbacks per-round to rebuild
     dynamic seed/text state.
     """
-    with open(log_path) as f:
-        data = json.load(f)
+    data = load_log_full(log_path)
     iters = data.get("iterations") or {}
     if not iters:
         if verbose:
@@ -731,9 +872,7 @@ class MorganAdaptiveExplorer:
         }
         if save_all:
             to_save["generated"] = dict(self.generated_data)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(to_save, f, indent=2)
+        _write_log_payload(to_save, path)
 
     def get_dataset(self) -> list:
         return list(self.dataset)
@@ -1040,9 +1179,7 @@ class ErgAdaptiveExplorer:
         }
         if save_all:
             to_save["generated"] = dict(self.generated_data)
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "w") as f:
-            json.dump(to_save, f, indent=2)
+        _write_log_payload(to_save, path)
 
     def get_dataset(self) -> list:
         return list(self.dataset)
