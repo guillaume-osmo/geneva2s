@@ -259,6 +259,76 @@ class AdaptiveSmilesExplorer:
 # Top-level run_adaptive — backend-agnostic adaptive sampling loop
 # ============================================================================
 
+def _resume_explorer(explorer, log_path: str, verbose: bool = True) -> int:
+    """Hydrate an explorer from a previous `save_log` JSON.
+
+    Restores `iteration_data`, `freq`, and `dataset` for any explorer type.
+    Then reconstructs mode-specific state from the accepted SMILES:
+
+    - `AdaptiveSmilesExplorer`: `cluster_counts` (InChIKey-3 prefix Counter)
+      is recomputed from the loaded SMILES, so a log written by a *different*
+      explorer (e.g. one that auto-switched to ERG mid-run) can still be
+      resumed in `default` mode coherently.
+    - `ErgAdaptiveExplorer`: `_centroids` and `_centroid_counts` are rebuilt
+      via `seed_dataset(all_accepted)`, which computes ERG FPs and seeds the
+      centroid bank (bounded by `max_centroids`). The original `cluster_counts`
+      integer indices in the saved JSON are not directly reusable since the
+      centroid identities change after re-seeding.
+    - `MorganAdaptiveExplorer`: not supported (would need an analogous
+      `seed_dataset` that recomputes Morgan FPs).
+
+    Sets `explorer.round = max(saved_rounds) + 1`. Returns that round number
+    so callers can replay any `after_round` callbacks per-round to rebuild
+    dynamic seed/text state.
+    """
+    with open(log_path) as f:
+        data = json.load(f)
+    iters = data.get("iterations") or {}
+    if not iters:
+        if verbose:
+            print(f"  resume: log {log_path} has no `iterations`; ignoring")
+        return 0
+
+    explorer.iteration_data = defaultdict(list, {
+        int(k): list(v) for k, v in iters.items()
+    })
+    explorer.freq = Counter(data.get("frequency", {}))
+
+    all_smiles = []
+    for r in sorted(explorer.iteration_data):
+        for row in explorer.iteration_data[r]:
+            smi = row.get("smiles")
+            if smi:
+                all_smiles.append(smi)
+                explorer.dataset.add(smi)
+
+    if isinstance(explorer, AdaptiveSmilesExplorer):
+        prefixes = Counter()
+        for smi in all_smiles:
+            p = get_inchikey_prefix(smi)
+            if p:
+                prefixes[p] += 1
+        explorer.cluster_counts = prefixes
+    elif isinstance(explorer, ErgAdaptiveExplorer):
+        if verbose:
+            print(f"  resume: reseeding ERG centroids from {len(all_smiles):,} accepted SMILES "
+                  f"(capped at max_centroids={explorer.max_centroids:,}) ...")
+        explorer.seed_dataset(all_smiles)
+    else:
+        raise NotImplementedError(
+            f"Resume not implemented for {type(explorer).__name__}. "
+            f"Use --mode default or --mode erg."
+        )
+
+    explorer.round = max(explorer.iteration_data) + 1
+    if verbose:
+        print(
+            f"  resumed: {len(all_smiles):,} accepted across {len(iters)} prior rounds; "
+            f"continuing at round {explorer.round}"
+        )
+    return explorer.round
+
+
 def run_adaptive(
     generator_func: Callable,
     n_rounds: int = 5,
@@ -272,6 +342,7 @@ def run_adaptive(
     auto_erg_drop: float = 0.01,
     auto_erg_patience: int = 2,
     after_round: Callable = None,
+    resume_log: str = None,
     **explorer_kwargs,
 ):
     """Run an adaptive multi-round sampling loop.
@@ -321,6 +392,19 @@ def run_adaptive(
     if verbose:
         print(f"adaptive: mode={mode}, rounds={n_rounds}, "
               f"n_per_round={n_samples_per_round}, explorer={type(explorer).__name__}")
+
+    if resume_log:
+        _resume_explorer(explorer, resume_log, verbose=verbose)
+        # Replay the per-round after_round callback so dynamic state
+        # (e.g. _run_mlx's text_state seed corpus) catches up with the
+        # accepted SMILES of every loaded round, in chronological order.
+        if after_round is not None:
+            for r in sorted(explorer.iteration_data):
+                try:
+                    after_round(explorer, r)
+                except Exception as e:
+                    if verbose:
+                        print(f"  [resume after_round@{r} {type(e).__name__}: {e}]")
 
     round_history = []
     for _ in range(n_rounds):

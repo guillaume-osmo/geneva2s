@@ -85,6 +85,44 @@ def _print_score(s, label=""):
     print(f"  novel:       {s['novel']}  ({100*s['novel']/max(1,s['total']):.2f}% of generated)")
 
 
+def _resolve_resume_path(arg_value: str, log_dir: str, label: str) -> str:
+    """Resolve --resume-from-log to a concrete file path.
+
+    - exact file path → returned as-is
+    - "latest" or a directory → newest `adaptive_<label>_*.json` in that
+      directory (or `--log-dir`, or `./logs`)
+    """
+    if not arg_value:
+        return None
+    p = Path(arg_value)
+    if p.is_file():
+        return str(p)
+    if str(p).lower() == "latest" or p.is_dir():
+        search_dir = p if p.is_dir() else Path(log_dir or "logs")
+        if not search_dir.is_dir():
+            raise FileNotFoundError(
+                f"--resume-from-log {arg_value!r}: no such directory {search_dir}"
+            )
+        prefix = f"adaptive_{label.lower()}"
+        candidates = sorted(
+            (c for c in search_dir.glob(f"{prefix}*.json")),
+            key=lambda x: x.stat().st_mtime, reverse=True,
+        )
+        if not candidates:
+            # Be lenient — also accept any adaptive_*.json if backend-specific
+            # ones aren't found (helps when resuming across backend renames).
+            candidates = sorted(
+                search_dir.glob("adaptive_*.json"),
+                key=lambda x: x.stat().st_mtime, reverse=True,
+            )
+        if not candidates:
+            raise FileNotFoundError(
+                f"--resume-from-log {arg_value!r}: no adaptive_*.json found in {search_dir}"
+            )
+        return str(candidates[0])
+    raise FileNotFoundError(f"--resume-from-log {arg_value!r}: not a file or directory")
+
+
 def _generation_phase(args, generator_func, train_canonical, label: str,
                       after_round=None):
     """Run either one-shot or adaptive generation given a backend's gen function."""
@@ -112,8 +150,16 @@ def _generation_phase(args, generator_func, train_canonical, label: str,
                 use_cluster=True,
                 max_cluster=args.max_per_cluster,
             )
-        log_path = (Path(args.log_dir) / f"adaptive_{label.lower()}.json"
+        log_stem = args.log_name or f"adaptive_{label.lower()}_{time.strftime('%Y%m%d_%H%M%S')}"
+        log_path = (Path(args.log_dir) / f"{log_stem}.json"
                     if args.log_dir else None)
+        if log_path:
+            print(f"  log will be written to: {log_path}")
+        resolved_resume = _resolve_resume_path(
+            args.resume_from_log, args.log_dir, label,
+        )
+        if resolved_resume:
+            print(f"  resuming from log: {resolved_resume}")
         explorer = run_adaptive(
             generator_func=generator_func,
             n_rounds=args.rounds,
@@ -125,6 +171,7 @@ def _generation_phase(args, generator_func, train_canonical, label: str,
             auto_erg_patience=args.auto_erg_patience,
             save_log_path=str(log_path) if log_path else None,
             after_round=after_round,
+            resume_log=resolved_resume,
             **explorer_kwargs,
         )
         gen_time = time.time() - t0
@@ -364,6 +411,16 @@ def main():
                    help="Number of consecutive down rounds required before switching")
     p.add_argument("--log-dir", default=None,
                    help="Directory to save adaptive logs (JSON)")
+    p.add_argument("--log-name", default=None,
+                   help="Base filename for the run log (no .json). Default: "
+                        "adaptive_<backend>_<YYYYMMDD_HHMMSS> — timestamped so "
+                        "parallel/successive runs don't overwrite each other.")
+    p.add_argument("--resume-from-log", default=None,
+                   help="Path to a prior adaptive log JSON to resume from. "
+                        "Loads iteration_data/freq/cluster_counts/dataset, "
+                        "replays after_round to rebuild the dynamic seed corpus, "
+                        "and continues at round=max(saved)+1. Supports "
+                        "--mode default/inchikey only.")
 
     # MLX-specific model variant flags
     p.add_argument("--metal", action="store_true",
