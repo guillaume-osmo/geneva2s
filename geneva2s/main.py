@@ -126,7 +126,7 @@ def _resolve_resume_path(arg_value: str, log_dir: str, label: str) -> str:
 
 
 def _generation_phase(args, generator_func, train_canonical, label: str,
-                      after_round=None):
+                      after_round=None, on_resume=None):
     """Run either one-shot or adaptive generation given a backend's gen function."""
     if args.adaptive:
         from .adaptive import run_adaptive
@@ -160,8 +160,20 @@ def _generation_phase(args, generator_func, train_canonical, label: str,
         resolved_resume = _resolve_resume_path(
             args.resume_from_log, args.log_dir, label,
         )
-        if resolved_resume:
+        # Fast-resume sidecar: explicit --resume-state, else auto-detect a
+        # `<resume_log>_state/` dir next to the resume log.
+        resume_state_dir = getattr(args, "resume_state", None)
+        if not resume_state_dir and resolved_resume:
+            cand = str(Path(resolved_resume).with_suffix("")) + "_state"
+            if Path(cand).is_dir():
+                resume_state_dir = cand
+        if resume_state_dir:
+            print(f"  FAST-resuming from sidecar: {resume_state_dir}")
+        elif resolved_resume:
             print(f"  resuming from log: {resolved_resume}")
+        # Write a fast-resume sidecar next to the output log.
+        save_state_dir = (str(log_path.with_suffix("")) + "_state"
+                          if log_path else None)
         explorer = run_adaptive(
             generator_func=generator_func,
             n_rounds=args.rounds,
@@ -174,6 +186,9 @@ def _generation_phase(args, generator_func, train_canonical, label: str,
             save_log_path=str(log_path) if log_path else None,
             after_round=after_round,
             resume_log=resolved_resume,
+            resume_state_dir=resume_state_dir,
+            on_resume=on_resume,
+            save_state_dir=save_state_dir,
             save_log_all=args.save_all,
             **explorer_kwargs,
         )
@@ -342,8 +357,17 @@ def _run_mlx_bilstm(args, raw, train_canonical):
         if addition:
             text_state["text"] = text_state["text"] + addition
 
+    def _seed_from_pool(explorer, seed_pool):
+        """Fast-resume hook: rebuild the seed corpus from the persisted sample
+        instead of replaying after_round over millions of accepted mols."""
+        if seed_pool:
+            addition = tok.prepare_corpus(seed_pool)
+            if addition:
+                text_state["text"] = text_state["text"] + addition
+
     return _generation_phase(args, gen_fn, train_canonical, "MLX",
-                              after_round=_extend_corpus)
+                              after_round=_extend_corpus,
+                              on_resume=_seed_from_pool)
 
 
 def _run_mlx_gpt(args, raw, train_canonical):
@@ -501,6 +525,11 @@ def main():
                         "replays after_round to rebuild the dynamic seed corpus, "
                         "and continues at round=max(saved)+1. Supports "
                         "--mode default/inchikey only.")
+    p.add_argument("--resume-state", default=None,
+                   help="Path to a fast-resume sidecar dir (centroids.npy + "
+                        "dataset.txt.gz + seed_pool.txt). ~12s reload vs the "
+                        "minutes-long full-log ERG reseed. ERG mode only. If "
+                        "omitted, a `<resume-log>_state/` sibling is auto-detected.")
 
     # MLX-specific model variant flags
     p.add_argument("--metal", action="store_true",

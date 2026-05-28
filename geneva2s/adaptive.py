@@ -401,6 +401,28 @@ class AdaptiveSmilesExplorer:
 # Top-level run_adaptive — backend-agnostic adaptive sampling loop
 # ============================================================================
 
+def build_resume_state_from_log(log_path: str, state_dir: str,
+                                 max_centroids: int = 2_000, verbose: bool = True):
+    """One-time: convert an existing JSON adaptive log into a fast-resume
+    sidecar (option A). Pays the expensive ERG reseed ONCE; afterwards every
+    resume from `state_dir` is ~12s instead of minutes.
+
+    ERG-mode only (uses ErgAdaptiveExplorer).
+    """
+    explorer = ErgAdaptiveExplorer(
+        generator_func=lambda n, t: [],
+        max_centroids=max_centroids,
+    )
+    _resume_explorer(explorer, log_path, verbose=verbose)
+    explorer.round = max(explorer.iteration_data) if explorer.iteration_data else 0
+    explorer.save_resume_state(state_dir)
+    if verbose:
+        print(f"  built resume-state sidecar at {state_dir} "
+              f"({len(explorer.dataset):,} dataset, "
+              f"{len(explorer._centroid_counts):,} centroids)")
+    return state_dir
+
+
 def _resume_explorer(explorer, log_path: str, verbose: bool = True) -> int:
     """Hydrate an explorer from a previous `save_log` JSON.
 
@@ -484,6 +506,9 @@ def run_adaptive(
     auto_erg_patience: int = 2,
     after_round: Callable = None,
     resume_log: str = None,
+    resume_state_dir: str = None,
+    on_resume: Callable = None,
+    save_state_dir: str = None,
     save_log_all: bool = False,
     **explorer_kwargs,
 ):
@@ -531,11 +556,20 @@ def run_adaptive(
             f"Expected one of: default, inchikey, morgan, discovery, erg"
         )
 
+    # Memory: only accumulate the per-round audit when --save-all is set.
+    explorer.keep_audit = bool(save_log_all)
+
     if verbose:
         print(f"adaptive: mode={mode}, rounds={n_rounds}, "
               f"n_per_round={n_samples_per_round}, explorer={type(explorer).__name__}")
 
-    if resume_log:
+    if resume_state_dir and hasattr(explorer, "load_resume_state"):
+        # FAST resume (option A): reload centroids + exact dedup set + seed
+        # pool from a sidecar — no ERG recompute, no JSON parse over millions.
+        seed_pool = explorer.load_resume_state(resume_state_dir, verbose=verbose)
+        if on_resume is not None:
+            on_resume(explorer, seed_pool)
+    elif resume_log:
         _resume_explorer(explorer, resume_log, verbose=verbose)
         # Replay the per-round after_round callback so dynamic state
         # (e.g. _run_mlx's text_state seed corpus) catches up with the
@@ -612,6 +646,15 @@ def run_adaptive(
         if verbose:
             mode_note = "all generated + accepted" if save_log_all else "accepted only"
             print(f"  log saved → {save_log_path} ({mode_note})")
+
+    # Write the fast-resume sidecar (option A) so the NEXT phase reloads in
+    # ~12s instead of recomputing ERG over every accepted molecule.
+    if save_state_dir and hasattr(explorer, "save_resume_state"):
+        explorer.save_resume_state(save_state_dir)
+        if verbose:
+            print(f"  resume-state sidecar → {save_state_dir} "
+                  f"({len(explorer.dataset):,} dataset, "
+                  f"{len(explorer._centroid_counts):,} centroids)")
 
     return explorer
 
@@ -969,6 +1012,9 @@ class ErgAdaptiveExplorer:
         self.freq: Counter = Counter()
         self.iteration_data: dict = defaultdict(list)
         self.generated_data: dict = defaultdict(list)
+        # When False, the per-round audit (generated_data) is NOT accumulated —
+        # saves ~4 GB at 15M-mol scale. Set True only when --save-all is given.
+        self.keep_audit: bool = False
 
         # Novelty + cluster assignment both run against centroids only — bounded
         # by the number of distinct clusters, not total accepted molecules.
@@ -981,6 +1027,80 @@ class ErgAdaptiveExplorer:
             return MurckoScaffold.MurckoScaffoldSmilesFromSmiles(smi)
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Fast resume-state sidecar (option A: exact dedup preserved)
+    # ------------------------------------------------------------------
+    def save_resume_state(self, state_dir: str, seed_pool_size: int = 50_000):
+        """Persist the minimal state needed to resume WITHOUT recomputing ERG
+        for every accepted molecule.
+
+        Writes:
+          centroids.npy        (n_cent, 315) float32  — the real "memory"
+          centroid_counts.json
+          dataset.txt.gz       all accepted SMILES (exact dedup, gzipped)
+          seed_pool.txt        up to `seed_pool_size` sampled SMILES (BiLSTM seeds)
+          meta.json            {round, max_freq, n_dataset, n_centroids}
+        """
+        import gzip, json as _json, os, random as _random
+        import numpy as _np
+        os.makedirs(state_dir, exist_ok=True)
+        if self._centroids is not None:
+            _np.save(os.path.join(state_dir, "centroids.npy"),
+                     _np.array(self._centroids).astype("float32"))
+        with open(os.path.join(state_dir, "centroid_counts.json"), "w") as f:
+            _json.dump(self._centroid_counts, f)
+        ds = list(self.dataset)
+        with gzip.open(os.path.join(state_dir, "dataset.txt.gz"), "wt") as f:
+            f.write("\n".join(ds))
+        pool = ds if len(ds) <= seed_pool_size else _random.sample(ds, seed_pool_size)
+        with open(os.path.join(state_dir, "seed_pool.txt"), "w") as f:
+            f.write("\n".join(pool))
+        with open(os.path.join(state_dir, "meta.json"), "w") as f:
+            _json.dump({
+                "round": self.round,
+                "max_freq": self.max_freq,
+                "n_dataset": len(ds),
+                "n_centroids": len(self._centroid_counts),
+                "novelty_threshold": self.novelty_threshold,
+                "cluster_threshold": self.cluster_threshold,
+                "max_centroids": self.max_centroids,
+            }, f, indent=2)
+        return state_dir
+
+    def load_resume_state(self, state_dir: str, verbose: bool = True):
+        """Reload state from a sidecar (see save_resume_state). Returns the
+        seed-pool list so the caller can rebuild the BiLSTM seed corpus
+        WITHOUT replaying after_round over millions of mols.
+
+        ~12s vs the ~3-4 min full-log reseed. Exact dedup preserved (option A).
+        """
+        import gzip, json as _json, os, time as _time
+        import numpy as _np
+        mx = self._mx
+        t0 = _time.time()
+        cpath = os.path.join(state_dir, "centroids.npy")
+        if os.path.exists(cpath):
+            self._centroids = mx.array(_np.load(cpath))
+        with open(os.path.join(state_dir, "centroid_counts.json")) as f:
+            self._centroid_counts = _json.load(f)
+        with gzip.open(os.path.join(state_dir, "dataset.txt.gz"), "rt") as f:
+            self.dataset = set(l for l in f.read().split("\n") if l)
+        with open(os.path.join(state_dir, "meta.json")) as f:
+            meta = _json.load(f)
+        self.round = int(meta["round"]) + 1
+        seed_pool_path = os.path.join(state_dir, "seed_pool.txt")
+        seed_pool = []
+        if os.path.exists(seed_pool_path):
+            with open(seed_pool_path) as f:
+                seed_pool = [l for l in f.read().split("\n") if l]
+        if verbose:
+            print(f"  fast-resume from {state_dir}: "
+                  f"{len(self.dataset):,} dataset, "
+                  f"{len(self._centroid_counts):,} centroids, "
+                  f"continuing at round {self.round} "
+                  f"({_time.time()-t0:.1f}s)")
+        return seed_pool
 
     def _append_rows(self, current, new_rows):
         """Concat an mx.array (N, D) with another (M, D) along axis 0. None-safe."""
@@ -1103,15 +1223,19 @@ class ErgAdaptiveExplorer:
                 accept = False
 
             cluster_id = best_cid if joins_existing else -1  # -1 = new cluster pending
-            self.generated_data[self.round].append({
-                "smiles": smi,
-                "round": self.round,
-                "freq": self.freq[smi],
-                "cluster": cluster_id,
-                "scaffold": scaff,
-                "erg_max_cosine": float(max_sims[i]),
-                "accepted": accept,
-            })
+            # Only accumulate the full audit trail when explicitly requested
+            # (--save-all). Otherwise this list grows to ~4 GB at 15M-mol scale
+            # for data we never serialize.
+            if self.keep_audit:
+                self.generated_data[self.round].append({
+                    "smiles": smi,
+                    "round": self.round,
+                    "freq": self.freq[smi],
+                    "cluster": cluster_id,
+                    "scaffold": scaff,
+                    "erg_max_cosine": float(max_sims[i]),
+                    "accepted": accept,
+                })
 
             if not accept:
                 continue
